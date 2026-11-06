@@ -311,7 +311,9 @@ end
 wire       fd_any         = ~&floppy_drive;
 
 wire       fd_mfmt        = fd_any && fdn_present[fdn] && fdn_mfmt[fdn];
-wire       fd_index       = fd_any ? (fd_mfmt ? mf_index : fdn_index[fdn]) : 1'b0;
+// floppy.v and the logic below use an active low index (0 during the pulse);
+// the MFMT drive outputs it active high
+wire       fd_index       = fd_any ? (fd_mfmt ? !mf_index : fdn_index[fdn]) : 1'b0;
 wire       fd_ready       = fd_any ? fdn_ready[fdn]       : 1'b0;
 wire [6:0] fd_track       = fd_any ? fdn_track[fdn]       : 7'd0;
 wire [4:0] fd_sector      = fd_any ? fdn_sector[fdn]      : 5'd0;

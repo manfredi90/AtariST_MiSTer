@@ -170,6 +170,26 @@ static Cmd run(uint8_t cmd, double max_ms)
 
 static double ms_to_disk(double ms) { return ms / DISK_SCALE; }   // real ms -> simulated ms
 
+// Type I status bit 1 is the index pulse: high only during the pulse, once per turn.
+// Polls the status register for a bit more than one turn after a type I command.
+static bool check_index_bit(const char *what, double turn_ms)
+{
+	double span = turn_ms * 1.3;
+	uint64_t end = ticks + (uint64_t)(span * 1e6 / NS_PER_TICK);
+	int hi = 0, n = 0, rises = 0, prev = -1;
+	while (ticks < end)
+	{
+		int b = (rd(R_CMD) >> 1) & 1;
+		if (b && prev != 1) rises++;   // a pulse already in progress at the start counts too
+		prev = b; hi += b; n++;
+		ticks_n(40);
+	}
+	double pct = 100.0 * hi / n;
+	bool ok = rises == 1 && pct > 0.5 && pct < 6.0;
+	printf("%s: index bit high %.1f %% of the time, %d pulse(s) in %.0f ms %s\n", what, pct, rises, span, ok ? "ok" : "FAIL");
+	return ok;
+}
+
 static int check_track(int cyl, int head, int &cur_cyl)
 {
 	const StxTrack *t = g_img->find(cyl, head);
@@ -354,6 +374,7 @@ static int check_st()
 	if (run(0x08, 3000).timeout) { printf(".st: restore timeout\n"); return 1; }
 
 	int fails = 0, checked = 0, cur = 0;
+	if (!check_index_bit(".st type I status", 200.0)) fails++;
 	for (int trk : { 0, 1, 40, 79 })
 		for (int side = 0; side < sides; side++)
 		{
@@ -427,6 +448,8 @@ int main(int argc, char **argv)
 		Cmd r = run(0x08, 3000);   // restore, no spin-up wait
 		if (r.timeout) { printf("%s: restore timeout\n", f); return 1; }
 		cur = 0;
+		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
+		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
 
 		int ff = 0, ft = 0;
 		for (int c = 0; c < img.cylinders(); c++)
