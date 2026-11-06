@@ -15,6 +15,7 @@
 #include <string.h>
 #include <math.h>
 #include <map>
+#include <algorithm>
 #include <vector>
 #include <string>
 #include "Vtb_top.h"
@@ -262,6 +263,8 @@ static int check_track(int cyl, int head, bool verbose)
 
 		// ID fields
 		auto rids = wd.read_addresses(0, ncells);
+		// an ID across the index (Turrican puts one there) is cut by the one-turn window
+		rids.erase(std::remove_if(rids.begin(), rids.end(), [&](const IdField &x) { return x.cell + 160 > ncells; }), rids.end());
 		ids_ref = rids.size();
 		for (auto &x : rids)
 		{

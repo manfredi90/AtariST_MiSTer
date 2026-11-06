@@ -17,18 +17,20 @@
 #include <vector>
 #include <string>
 #include "Vfdc1772.h"
+#include "Vfdc1772___024root.h"
+#include "Vfdc1772_fdc1772.h"
 #include "verilated.h"
 #include "st_stx.h"
 #include "wdsim.h"
 
 // The clock is always 32 MHz (31.25 ns per tick, clk8m_en every 4 ticks).
-// CLKCPU_KHZ is the value given to the core's MFMT drive: below 32000 the
-// disk turns faster than real by 32000 / CLKCPU_KHZ, to test many tracks.
-#ifndef CLKCPU_KHZ
-#define CLKCPU_KHZ 32000
+// TB_CLKCPU_KHZ is the value given to the core's MFMT drive: below 32000 the
+// disk turns faster than real by 32000 / TB_CLKCPU_KHZ, to test many tracks.
+#ifndef TB_CLKCPU_KHZ
+#define TB_CLKCPU_KHZ 32000
 #endif
 static const double NS_PER_TICK = 31.25;
-static const double DISK_SCALE = 32000.0 / CLKCPU_KHZ;
+static const double DISK_SCALE = 32000.0 / TB_CLKCPU_KHZ;
 
 static Vfdc1772 *top;
 static uint64_t ticks;
@@ -55,6 +57,9 @@ static const Track &get_track(int cyl, int head)
 
 // ---- Main side: hps_io sd emulation ----
 static struct { int state = 0, wait = 0; std::vector<uint16_t> words; size_t i = 0; } sd;
+static uint32_t sd_latency_max = 0;     // ticks; random delay before Main answers (real Main polls)
+static uint32_t lat_rng = 1;
+static uint32_t rnd() { lat_rng = lat_rng * 1664525u + 1013904223u; return lat_rng >> 8; }
 
 static void sd_step()
 {
@@ -86,10 +91,11 @@ static void sd_step()
 				if (off < st_file.size()) memcpy(sd.words.data(), &st_file[off], std::min(st_file.size() - off, (size_t)nwords * 2));
 			}
 			else printf("  unexpected sector request lba %u\n", lba);
-			top->sd_ack = 1;
-			sd.state = 1; sd.wait = 20;
+			sd.state = 4;
+			sd.wait = 20 + (sd_latency_max ? rnd() % sd_latency_max : 0);
 		}
 		break;
+	case 4: if (--sd.wait == 0) { top->sd_ack = 1; sd.state = 1; sd.wait = 20; } break;
 	case 1: if (--sd.wait == 0) { sd.state = 2; sd.i = 0; } break;
 	case 2:
 		if (ticks % 3 == 0)
@@ -107,8 +113,23 @@ static void sd_step()
 	}
 }
 
+struct Ev { uint64_t t; char what; int v; };
+static std::vector<Ev> evs;
+static void tick_events()
+{
+	static int pv = 0, pi = 0, pe = 0;
+	auto *R = top->rootp->fdc1772;
+	int v = R->mfmt_drive__DOT__valid, ix = R->mf_index, es = R->mf_estate;
+	if (v != pv) evs.push_back({ ticks, 'L', v });
+	if (ix && !pi) evs.push_back({ ticks, 'I', (int)R->mf_position });
+	if (es != pe) evs.push_back({ ticks, 'E', es });
+	if (R->mf_dec_stb && es == 2 && 0) evs.push_back({ ticks, 'b', R->mf_dec_val });
+	pv = v; pi = ix; pe = es;
+}
+
 static void tick()
 {
+	tick_events();
 	sd_step();
 	top->clk8m_en = (ticks % 4) == 0;
 	top->clkcpu = 0; top->eval();
@@ -151,6 +172,7 @@ struct Cmd
 static Cmd run(uint8_t cmd, double max_ms)
 {
 	Cmd c;
+	evs.clear();
 	wr(R_CMD, cmd);
 	uint64_t limit = ticks + (uint64_t)(max_ms * 1e6 / NS_PER_TICK);
 	while (!top->irq)
@@ -403,17 +425,100 @@ static int check_st()
 	return fails;
 }
 
+
+// Random reads like a game loader: random track, side and moment, side
+// toggles right before the command, commands right after a seek (track still
+// loading), idle times long enough for the motor to stop, h/e flags.
+static int stress(int iters, int &cur)
+{
+	struct Ref { int cyl, head; const StxSector *s; };
+	std::vector<Ref> refs;
+	for (auto &t : g_img->tracks())
+	{
+		for (auto &s : t.sectors)
+		{
+			if (!s.data || (s.status & 0x18) || s.fuzzy) continue;
+			int dup = 0;
+			for (auto &x : t.sectors) if (x.id[0] == s.id[0] && x.id[2] == s.id[2]) dup++;
+			if (dup == 1) refs.push_back({ t.cylinder, t.head, &s });
+		}
+	}
+	if (refs.empty()) return 0;
+	int fails = 0;
+	for (int it = 0; it < iters; it++)
+	{
+		const Ref &r = refs[rnd() % refs.size()];
+		uint32_t a = rnd();
+		if ((a & 15) == 0) ticks_n((int)((rnd() % 2600) * 1e6 / NS_PER_TICK / (DISK_SCALE > 1 ? 1 : 1)));  // up to 2.6 s idle: motor off
+		else ticks_n(rnd() % 200000);
+		top->floppy_side = r.head ? 0 : 1;
+		int sought = r.cyl != cur;
+		if (r.cyl != cur)
+		{
+			wr(R_DATA, r.cyl);
+			Cmd sk = run(0x18 | (rnd() & 3), 3000);
+			if (sk.timeout) { printf("stress %d: seek timeout\n", it); fails++; continue; }
+			cur = r.cyl;
+		}
+		if ((a >> 4 & 3) == 0)
+		{
+			// toggle the side for a moment: the drive starts loading the other side
+			top->floppy_side = !top->floppy_side;
+			ticks_n(rnd() % 50000);
+			top->floppy_side = r.head ? 0 : 1;
+		}
+		wr(R_TRACK, r.s->id[0]);
+		wr(R_SECTOR, r.s->id[2]);
+		uint8_t cmd = 0x80 | ((a >> 6 & 1) ? 0x08 : 0) | ((a >> 7 & 1) ? 0x04 : 0);
+		Cmd c = run(cmd, ms_to_disk(200.0 * 8) + 3000.0 * (DISK_SCALE > 1 ? 1.0 / DISK_SCALE : 1) + 100);
+		bool ok = !c.timeout && !(c.status & 0x1C) && (int)c.data.size() == r.s->size && !memcmp(c.data.data(), r.s->data, r.s->size);
+		if (!ok)
+		{
+			fails++;
+			printf("stress %d: c%02d h%d sector %02x cmd %02x: %s status %02x, %zu bytes [long idle %d, seek %d, side toggle %d]\n", it, r.cyl, r.head, r.s->id[2], cmd,
+				c.timeout ? "TIMEOUT" : "FAIL", c.status, c.data.size(), (a & 15) == 0, sought, (a >> 4 & 3) == 0);
+			{
+				uint64_t t0 = evs.empty() ? ticks : evs.front().t;
+				printf("    events (ms of disk time from the command):");
+				for (auto &e : evs) printf(" %c%d@%.1f", e.what, e.v, (e.t - t0) * NS_PER_TICK * DISK_SCALE / 1e6);
+				printf("\n");
+			}
+			Cmd dbg = run(0xC8, ms_to_disk(200.0 * 8) + 100);
+			{
+				auto *R = top->rootp->fdc1772;
+				printf("    loader: lstate %d valid %d key_valid %d key_cyl %d key_head %d sd_rd %d sd_ack %d tb_sd_state %d mf_busy %d\n",
+					R->mfmt_drive__DOT__lstate, R->mfmt_drive__DOT__valid, R->mfmt_drive__DOT__key_valid,
+					R->mfmt_drive__DOT__key_cyl, R->mfmt_drive__DOT__key_head, top->sd_rd, top->sd_ack, sd.state, R->mf_sd_busy);
+				printf("    play: cur_ok %d sstate %d nw_ready %d nw_w %d c %d sbusy %d pf_go %d t_i %d\n",
+					R->mfmt_drive__DOT__cur_ok, R->mfmt_drive__DOT__sstate, R->mfmt_drive__DOT__nw_ready, R->mfmt_drive__DOT__nw_w,
+					R->mfmt_drive__DOT__c, R->mfmt_drive__DOT__sbusy, R->mfmt_drive__DOT__pf_go, R->mfmt_drive__DOT__t_i);
+			}
+			printf("    then read address: status %02x id %s (physical track wanted %d)\n", dbg.status,
+				dbg.data.size() == 6 ? (std::to_string(dbg.data[0]) + "/" + std::to_string(dbg.data[1]) + "/" + std::to_string(dbg.data[2])).c_str() : "-", r.cyl);
+		}
+		if ((a >> 8 & 7) == 0)
+		{
+			Cmd ra = run(0xC8, ms_to_disk(200.0 * 8) + 100);
+			if (ra.timeout || (ra.status & 0x10) || ra.data.size() != 6) { fails++; printf("stress %d: read address failed (status %02x)\n", it, ra.status); }
+		}
+		if (it % 100 == 99) printf("stress: %d reads, %d failures\n", it + 1, fails);
+	}
+	return fails;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	Verilated::commandArgs(argc, argv);
 	top = new Vfdc1772;
-	int only_c = -1, only_h = -1, every = 1, fails = 0;
+	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0;
 	std::vector<const char *> files;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "-t") && i + 2 < argc) { only_c = atoi(argv[++i]); only_h = atoi(argv[++i]); }
 		else if (!strcmp(argv[i], "-n") && i + 1 < argc) every = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-stress") && i + 1 < argc) stress_n = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-lat") && i + 1 < argc) sd_latency_max = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
 		else if (!strcmp(argv[i], "-v")) verbose = 1;
 		else if (!strcmp(argv[i], "-st")) { fails += check_st(); }
 		else if (argv[i][0] != '+') files.push_back(argv[i]);
@@ -451,6 +556,14 @@ int main(int argc, char **argv)
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
 
+		if (stress_n)
+		{
+			int sf = stress(stress_n, cur);
+			printf("%s: stress %d reads, %d failures\n", f, stress_n, sf);
+			fails += sf;
+			continue;
+		}
+
 		int ff = 0, ft = 0;
 		for (int c = 0; c < img.cylinders(); c++)
 			for (int h = 0; h < img.heads(); h++)
@@ -460,7 +573,7 @@ int main(int argc, char **argv)
 				ff += check_track(c, h, cur);
 				ft++;
 			}
-		printf("%s: %d/%d tracks ok (clkcpu %d kHz, disk x%.0f)\n", f, ft - ff, ft, CLKCPU_KHZ, DISK_SCALE);
+		printf("%s: %d/%d tracks ok (clkcpu %d kHz, disk x%.0f)\n", f, ft - ff, ft, TB_CLKCPU_KHZ, DISK_SCALE);
 		fails += ff;
 	}
 	printf("%s\n", fails ? "SOME TRACKS FAILED" : "all tracks ok");

@@ -193,9 +193,10 @@ localparam S_IDLE = 0, S_TREAD = 1, S_TWAIT = 2, S_TGET = 3, S_TCHK = 4,
 reg  [3:0] sstate;
 
 // request
-reg        pf_go, pf_seek, pf_imm;
+reg        pf_go, pf_seek;  // request (held until pf_ack) and its parameters
 reg [12:0] pf_w;
-reg        pf_seek_r, pf_imm_r;
+reg        pf_seek_r;
+reg        pf_ack;          // the sequencer took the request
 
 // timing state: entry t_i starts at t_ns with length t_nl; t_len applies before it
 reg  [8:0] t_i;
@@ -210,22 +211,21 @@ reg        w_valid;
 reg [15:0] nw_word, nw_mask, nw_len;
 reg [12:0] nw_w;
 reg        nw_ready;
-reg        nw_imm;          // apply at once (start of playback)
 reg        sbusy;
 reg        half;            // second word of a table entry
 
 always @(posedge clk) begin
+	pf_ack <= 0;
 	if (reset || !valid) begin
 		sstate <= S_IDLE;
 		nw_ready <= 0;
 		sbusy <= 0;
-		nw_imm <= 0;
 	end
 	else begin
-		nw_imm <= 0;
 		case (sstate)
 		S_IDLE:
-			if (pf_go) begin
+			if (pf_go && !pf_ack) begin
+				pf_ack <= 1;
 				sbusy <= 1;
 				nw_ready <= 0;
 				nw_w <= pf_w;
@@ -320,7 +320,6 @@ always @(posedge clk) begin
 			nw_mask <= (w_valid && {3'b000, nw_w} >= w_s) ? pool_q : 16'h0000;
 			nw_len <= t_len;
 			nw_ready <= 1;
-			nw_imm <= pf_imm_r;
 			sbusy <= 0;
 			sstate <= S_IDLE;
 		end
@@ -329,10 +328,7 @@ always @(posedge clk) begin
 	end
 end
 
-always @(posedge clk) if (pf_go && sstate == S_IDLE) begin
-	pf_seek_r <= pf_seek;
-	pf_imm_r <= pf_imm;
-end
+always @(posedge clk) if (pf_go && !pf_ack && sstate == S_IDLE) pf_seek_r <= pf_seek;
 
 // ---------------------------------------------------------------------------
 // playback
@@ -357,6 +353,25 @@ function [12:0] word_after(input [12:0] w);
 	word_after = (w + 1'd1 >= nwords) ? 13'd0 : w + 1'd1;
 endfunction
 
+// When the word under the head is not ready (just loaded, or a prefetch came
+// too late) the sequencer prepares a word LEAD words ahead, far enough to
+// cover its longest search (all 256 timing and 48 weak entries, ~1300
+// clocks), and playback resumes there. Until then the head reads no flux.
+localparam integer CLKS_PER_WORD = (16 * 32000) / ACC_STEP;
+localparam integer LEAD = 1400 / CLKS_PER_WORD + 2;
+
+function [12:0] ahead(input [12:0] w);
+	reg [13:0] s;
+	s = {1'b0, w} + LEAD[13:0];
+	ahead = (s >= {1'b0, nwords}) ? 13'(s - {1'b0, nwords}) : s[12:0];
+endfunction
+
+function [12:0] word_dist(input [12:0] from, input [12:0] to);
+	word_dist = (to >= from) ? to - from : 13'(to + nwords - from);
+endfunction
+
+wire inflight = pf_go || sbusy;
+
 // bits of the word under the head after the next cell step (the word
 // changes on the same clock when the next cell starts a word)
 wire        next_new  = (c_next[3:0] == 0) && nw_ready && (nw_w == c_next[16:4]);
@@ -367,7 +382,7 @@ wire  [3:0] next_bit  = 4'd15 - c_next[3:0];
 always @(posedge clk) begin
 	lfsr <= {lfsr[30:0], lfsr[31] ^ lfsr[21] ^ lfsr[1] ^ lfsr[0]};
 	cell_stb <= 0;
-	pf_go <= 0;
+	if (pf_ack) pf_go <= 0;      // a new request below on the same clock wins
 
 	if (index_cnt != 0) index_cnt <= index_cnt - 1'd1;
 	else index <= 0;
@@ -377,28 +392,20 @@ always @(posedge clk) begin
 		c <= 0;
 		cur_ok <= 0;
 		index <= 0;
+		pf_go <= 0;
 	end
 	else begin
-		if (!valid) cur_ok <= 0;
+		if (!valid) begin
+			cur_ok <= 0;
+			pf_go <= 0;
+		end
 
-		// a new track is in memory: prepare the word under the head
+		// a new track is in memory: prepare a word a little ahead of the head
 		if (load_done) begin
 			cur_ok <= 0;
 			if (c >= ncells) c <= 0;
-			pf_w <= (c >= ncells) ? 13'd0 : c[16:4];
+			pf_w <= ahead((c >= ncells) ? 13'd0 : c[16:4]);
 			pf_seek <= 1;
-			pf_imm <= 1;
-			pf_go <= 1;
-		end
-
-		if (nw_imm && nw_ready) begin
-			cur_word <= nw_word;
-			cur_mask <= nw_mask;
-			cur_len <= nw_len;
-			cur_ok <= 1;
-			pf_w <= word_after(nw_w);
-			pf_seek <= (word_after(nw_w) == 0);
-			pf_imm <= 0;
 			pf_go <= 1;
 		end
 
@@ -412,31 +419,34 @@ always @(posedge clk) begin
 				index_cnt <= INDEX_CLKS[17:0];
 			end
 
-			// entering a new word: take the prefetched one, prefetch the next
-			if (c_next[3:0] == 0 && valid && formatted) begin
-				if (nw_ready && nw_w == c_next[16:4] && cur_ok) begin
+			// entering a new word
+			if (c_next[3:0] == 0 && valid && formatted && !load_done) begin
+				if (nw_ready && nw_w == c_next[16:4]) begin
+					// the prefetched word: play it, prefetch the next one
 					cur_word <= nw_word;
 					cur_mask <= nw_mask;
 					cur_len <= nw_len;
+					cur_ok <= 1;
 					pf_w <= word_after(c_next[16:4]);
 					pf_seek <= (word_after(c_next[16:4]) == 0);
-					pf_imm <= 0;
 					pf_go <= 1;
 				end
-				else if (cur_ok) begin
-					// prefetch late (cannot happen with >= 64 clocks per word): resync
+				else begin
 					cur_ok <= 0;
-					pf_w <= c_next[16:4];
-					pf_seek <= 1;
-					pf_imm <= 1;
-					pf_go <= 1;
+					// nothing on the way for a word just ahead: aim further on
+					if (!inflight && !(nw_ready && word_dist(c_next[16:4], nw_w) <= LEAD[12:0])) begin
+						pf_w <= ahead(c_next[16:4]);
+						pf_seek <= 1;
+						pf_go <= 1;
+					end
 				end
 			end
 
 			// value of the new cell
 			if (!valid || !enable) cell_bit <= 0;                         // loading: no flux
 			else if (!formatted) cell_bit <= lfsr[0];                     // unformatted: noise
-			else if (!cur_ok) cell_bit <= 0;
+			else if (!next_new && !cur_ok) cell_bit <= 0;
+			else if (c_next[3:0] == 0 && !next_new) cell_bit <= 0;        // word not ready
 			else cell_bit <= next_mask[next_bit] ? lfsr[0] : next_word[next_bit];
 		end
 		else acc <= acc_n[16:0];

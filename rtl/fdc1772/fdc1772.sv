@@ -891,7 +891,9 @@ always @(posedge clkcpu) begin
 
 	// ---- look for an ID field: A1 A1 A1 FE
 	ME_ID: begin
-		if (index_rise) begin
+		// turns only count while the track is in memory: a slow answer from
+		// Main is not a turn of the disk without the sector
+		if (index_rise && mf_loaded) begin
 			revs <= revs + 1'd1;
 			// read sector: 5 turns, read address: 6 turns, then record not found
 			if (revs + 1'd1 == ((mf_op == MF_OP_RADDR) ? 3'd6 : 3'd5)) begin
