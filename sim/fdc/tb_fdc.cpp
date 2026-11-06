@@ -36,6 +36,7 @@ static int verbose = 0;
 
 struct Track { std::vector<uint8_t> meta, cells; };
 static const StxImage *g_img;
+static std::vector<uint8_t> st_file;   // plain .st image for the sector path regression test
 static std::map<int, Track> cache;
 
 static const Track &get_track(int cyl, int head)
@@ -61,7 +62,14 @@ static void sd_step()
 	switch (sd.state)
 	{
 	case 0:
-		if (top->sd_rd)
+		if (top->sd_wr && !top->sd_rd)
+		{
+			// write (sector path only): acknowledge, the data is not kept
+			sd.words.clear();
+			top->sd_ack = 1;
+			sd.state = 3; sd.wait = 300;
+		}
+		else if (top->sd_rd)
 		{
 			uint32_t lba = top->sd_lba;
 			int nwords = (top->sd_blk_cnt + 1) * 256;
@@ -71,6 +79,11 @@ static void sd_step()
 				const Track &t = get_track(lba & 0xFF, (lba >> 8) & 1);
 				const std::vector<uint8_t> &src = ((lba >> 16) & 3) ? t.cells : t.meta;
 				memcpy(sd.words.data(), src.data(), std::min(src.size(), (size_t)nwords * 2));
+			}
+			else if (!st_file.empty())
+			{
+				size_t off = (size_t)lba * 512;
+				if (off < st_file.size()) memcpy(sd.words.data(), &st_file[off], std::min(st_file.size() - off, (size_t)nwords * 2));
 			}
 			else printf("  unexpected sector request lba %u\n", lba);
 			top->sd_ack = 1;
@@ -320,8 +333,58 @@ static int check_track(int cyl, int head, int &cur_cyl)
 	return fails ? 1 : 0;
 }
 
+// Regression test of the unchanged sector path: plain .st image, 9 sectors/track, 2 sides
+static int check_st()
+{
+	const int spt = 9, sides = 2, tracks = 80;
+	st_file.resize((size_t)tracks * sides * spt * 512);
+	uint32_t x = 12345;
+	for (auto &b : st_file) { x = x * 1103515245u + 12345u; b = x >> 16; }
+
+	top->floppy_reset = 0; top->cpu_sel = 0; top->cpu_rw = 1;
+	top->floppy_drive = 2; top->floppy_side = 1;
+	top->img_wp = 0; top->img_mfmt = 0; top->img_size = 0; top->img_mounted = 0;
+	ticks_n(100);
+	top->floppy_reset = 1;
+	ticks_n(100);
+	top->img_size = (uint32_t)st_file.size(); top->img_mfmt = 0; top->img_mounted = 1;
+	ticks_n(4);
+	top->img_mounted = 0;
+	ticks_n(100);
+	if (run(0x08, 3000).timeout) { printf(".st: restore timeout\n"); return 1; }
+
+	int fails = 0, checked = 0, cur = 0;
+	for (int trk : { 0, 1, 40, 79 })
+		for (int side = 0; side < sides; side++)
+		{
+			top->floppy_side = side ? 0 : 1;
+			if (trk != cur) { wr(R_DATA, trk); run(0x18, 2000); cur = trk; }
+			Cmd a = run(0xC8, 2000);
+			if (a.data.size() != 6 || a.data[0] != trk || a.data[3] != 2 || (a.status & 0x18)) { printf(".st c%02d h%d: read address bad\n", trk, side); fails++; }
+			for (int sec = 1; sec <= spt; sec++)
+			{
+				wr(R_TRACK, trk);
+				wr(R_SECTOR, sec);
+				Cmd c = run(0x88, 2000);
+				size_t off = (((size_t)trk * sides + side) * spt + sec - 1) * 512;
+				bool ok = !c.timeout && c.data.size() == 512 && !(c.status & 0x1C) && !memcmp(c.data.data(), &st_file[off], 512);
+				if (!ok) { printf(".st c%02d h%d s%d: FAIL (status %02x, %zu bytes)\n", trk, side, sec, c.status, c.data.size()); fails++; }
+				checked++;
+			}
+			// writes on a .st are still accepted (no write protect)
+			wr(R_TRACK, trk);
+			wr(R_SECTOR, 1);
+			Cmd w = run(0xA8, 2000);
+			if (w.status & 0x40) { printf(".st c%02d h%d: write reported write protect\n", trk, side); fails++; }
+		}
+	printf(".st sector path: %d sectors read, %s\n", checked, fails ? "FAIL" : "ok");
+	st_file.clear();
+	return fails;
+}
+
 int main(int argc, char **argv)
 {
+	setvbuf(stdout, nullptr, _IOLBF, 0);
 	Verilated::commandArgs(argc, argv);
 	top = new Vfdc1772;
 	int only_c = -1, only_h = -1, every = 1, fails = 0;
@@ -331,6 +394,7 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "-t") && i + 2 < argc) { only_c = atoi(argv[++i]); only_h = atoi(argv[++i]); }
 		else if (!strcmp(argv[i], "-n") && i + 1 < argc) every = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-v")) verbose = 1;
+		else if (!strcmp(argv[i], "-st")) { fails += check_st(); }
 		else if (argv[i][0] != '+') files.push_back(argv[i]);
 	}
 	for (const char *f : files)
