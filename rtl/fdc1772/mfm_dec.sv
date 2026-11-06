@@ -22,7 +22,8 @@
 module mfm_dec
 (
 	input            clk,
-	input            restart,    // forget the current byte boundary
+	input            restart,    // forget the current byte boundary (a cell on the
+	                             // same clock starts the new byte)
 	input      [1:0] mode,
 	input            cell_stb,
 	input            cell_bit,
@@ -43,7 +44,8 @@ reg  [4:0] count;
 wire [15:0] sh = {shift[14:0], cell_bit};
 wire        a1 = sh == 16'h4489;
 wire        c2 = sh == 16'h5224;
-wire  [4:0] cn = count + 1'd1;
+// a restart together with a cell makes that cell the first of a new byte
+wire  [4:0] cn = restart ? 5'd1 : count + 1'd1;
 
 function [7:0] data_bits(input [15:0] raw);
 	data_bits = {raw[14], raw[12], raw[10], raw[8], raw[6], raw[4], raw[2], raw[0]};
@@ -51,7 +53,7 @@ endfunction
 
 always @(posedge clk) begin
 	byte_stb <= 0;
-	if (restart) count <= 0;
+	if (restart && !cell_stb) count <= 0;
 	else if (cell_stb) begin
 		shift <= sh;
 		count <= cn;

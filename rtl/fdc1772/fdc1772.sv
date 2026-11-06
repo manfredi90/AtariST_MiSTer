@@ -48,11 +48,13 @@ module fdc1772 (
 	input      [W:0] img_wp,      // write protect
 	input            img_ds,      // double-sided image (for BBC Micro only)
 	input     [31:0] img_size,    // size of image in bytes
-	output reg[31:0] sd_lba,
-	output reg [W:0] sd_rd,
+	input            img_mfmt,    // MFMT bit-cell track image (Main: img_size[63:56] == 1)
+	output    [31:0] sd_lba,
+	output     [W:0] sd_rd,
 	output reg [W:0] sd_wr,
+	output     [5:0] sd_blk_cnt,
 	input            sd_ack,
-	input      [7:0] sd_buff_addr,
+	input     [12:0] sd_buff_addr,
 	input     [15:0] sd_dout,
 	output    [15:0] sd_din,
 	input            sd_dout_strobe
@@ -60,6 +62,7 @@ module fdc1772 (
 
 
 parameter CLK_EN           = 16'd8000; // in kHz
+parameter CLKCPU_KHZ       = 32000;    // clkcpu frequency, for the MFMT drive timing
 parameter FD_NUM           = 2;    // number of supported floppies
 parameter MODEL            = 2;    // 0 - wd1770, 1 - fd1771, 2 - wd1772, 3 = wd1773/fd1793
 parameter EXT_MOTOR        = 1'b0; // != 0 if motor is controlled externally by floppy_motor
@@ -86,6 +89,7 @@ reg         fdn_doubleside[FD_NUM];
 reg         fdn_hd[FD_NUM];
 reg         fdn_fm[FD_NUM];
 reg         fdn_present[FD_NUM];
+reg         fdn_mfmt[FD_NUM];   // image is an MFMT track image
 
 reg  [11:0] image_sectors;
 reg  [11:0] image_sps; // sectors/side
@@ -96,6 +100,7 @@ wire        image_hd = img_size[20];
 reg         image_fm;
 
 reg   [1:0] sector_size_code; // sec size 0=128, 1=256, 2=512, 3=1024
+reg  [31:0] sd_lba_sec;       // lba of the sector path
 reg  [10:0] sector_size;
 reg         sector_base; // number of first sector on track (archie 0, dos 1)
 
@@ -105,7 +110,7 @@ always @(*) begin
 		// archie, 1024 bytes/sector
 		sector_size_code = 2'd3;
 		sector_base = 0;
-		sd_lba = {(16'd0 + (fd_spt*track[6:0]) << fd_doubleside) + (floppy_side ? 5'd0 : fd_spt) + sector[4:0], s_odd };
+		sd_lba_sec = {(16'd0 + (fd_spt*track[6:0]) << fd_doubleside) + (floppy_side ? 5'd0 : fd_spt) + sector[4:0], s_odd };
 
 		image_fm = 0;
 		image_sectors = img_size[21:10];
@@ -118,7 +123,7 @@ always @(*) begin
 		// this block is valid for the .st format (or similar arrangement), 512 bytes/sector
 		sector_size_code = 2'd2;
 		sector_base = 1;
-		sd_lba = ((fd_spt*track[6:0]) << fd_doubleside) + (floppy_side ? 5'd0 : fd_spt) + sector[4:0] - 1'd1;
+		sd_lba_sec = ((fd_spt*track[6:0]) << fd_doubleside) + (floppy_side ? 5'd0 : fd_spt) + sector[4:0] - 1'd1;
 
 		image_fm = 0;
 		image_sectors = img_size[20:9];
@@ -153,10 +158,10 @@ always @(*) begin
 		sector_size_code = 2'd1;
 		sector_base = 0;
 		if (IMG_TYPE == IMG_BBC) begin
-			sd_lba = (((fd_spt*track[6:0]) << fd_doubleside) + (floppy_side ? 5'd0 : fd_spt) + sector[4:0]) >> 1;
+			sd_lba_sec = (((fd_spt*track[6:0]) << fd_doubleside) + (floppy_side ? 5'd0 : fd_spt) + sector[4:0]) >> 1;
 			image_spt = 10;
 		end else begin
-			sd_lba = (fd_spt*(floppy_side ? track[5:0] : 79-track[5:0]) + sector[4:0]) >> 1;
+			sd_lba_sec = (fd_spt*(floppy_side ? track[5:0] : 79-track[5:0]) + sector[4:0]) >> 1;
 			image_spt = 9;
 		end
 
@@ -172,7 +177,7 @@ always @(*) begin
 	default: begin
 		sector_size_code = 2'd0;
 		sector_base = 0;
-		sd_lba = 0;
+		sd_lba_sec = 0;
 		image_fm = 0;
 		image_sectors = 0;
 		image_doubleside = 0;
@@ -193,6 +198,7 @@ always @(posedge clkcpu) begin
 	for(i = 0; i < FD_NUM; i = i+1'd1) begin
 		if (~img_mountedD[i] && img_mounted[i]) begin
 			fdn_present[i] <= |img_size;
+			fdn_mfmt[i] <= img_mfmt && |img_size;
 			fdn_sector_len[i] <= sector_size;
 			fdn_spt[i] <= image_spt;
 			fdn_gap_len[i] <= image_gap_len;
@@ -304,7 +310,8 @@ end
 
 wire       fd_any         = ~&floppy_drive;
 
-wire       fd_index       = fd_any ? fdn_index[fdn]       : 1'b0;
+wire       fd_mfmt        = fd_any && fdn_present[fdn] && fdn_mfmt[fdn];
+wire       fd_index       = fd_any ? (fd_mfmt ? mf_index : fdn_index[fdn]) : 1'b0;
 wire       fd_ready       = fd_any ? fdn_ready[fdn]       : 1'b0;
 wire [6:0] fd_track       = fd_any ? fdn_track[fdn]       : 7'd0;
 wire [4:0] fd_sector      = fd_any ? fdn_sector[fdn]      : 5'd0;
@@ -312,7 +319,8 @@ wire       fd_sector_hdr  = fd_any ? fdn_sector_hdr[fdn]  : 1'b0;
 //wire     fd_sector_data = fd_any ? fdn_sector_data[fdn] : 1'b0;
 wire       fd_dclk_en     = fd_any ? fdn_dclk[fdn]        : 1'b0;
 wire       fd_present     = fd_any ? fdn_present[fdn]     : 1'b0;
-wire       fd_writeprot   = fd_any ? img_wp[fdn]          : 1'b1;
+// MFMT images are read-only for now: writes end with write protect
+wire       fd_writeprot   = fd_any ? (img_wp[fdn] | fd_mfmt) : 1'b1;
 
 wire       fd_doubleside  = fdn_doubleside[fdn];
 wire [4:0] fd_spt         = fdn_spt[fdn];
@@ -371,6 +379,7 @@ wire fd_track0 = (fd_track == 0);
 
 reg [7:0] step_to;
 reg RNF;
+reg [1:0] mf_phase;
 reg sector_inc_strobe;
 reg track_inc_strobe;
 reg track_dec_strobe;
@@ -403,6 +412,8 @@ always @(posedge clkcpu) begin
 		irq_at_index <= 1'b0;
 		data_transfer_state <= 2'b00;
 		RNF <= 1'b0;
+		mf_phase <= 0;
+		mf_start <= 1'b0;
 	end else if (clk8m_en) begin
 		sd_card_read <= 0;
 		sd_card_write <= 0;
@@ -430,6 +441,8 @@ always @(posedge clkcpu) begin
 			notready_wait <= 1'b0;
 			sector_not_found <= 1'b0;
 			data_transfer_state <= 2'b00;
+			mf_phase <= 0;
+			mf_start <= 1'b0;
 
 			if(cmd_type_1 || cmd_type_2 || cmd_type_3) begin
 				RNF <= 1'b0;
@@ -441,6 +454,7 @@ always @(posedge clkcpu) begin
 			// handle "forced interrupt"
 			if(cmd_type_4) begin
 				busy <= 1'b0;
+				mf_start <= 1'b0;
 				if(cmd[3]) irq_set <= 1'b1;
 				if(cmd[3:2] == 2'b01) irq_at_index <= 1'b1;
 				// From Hatari: Starting a Force Int command when idle should set the motor bit and clear the spinup bit (verified on STF)
@@ -562,6 +576,34 @@ always @(posedge clkcpu) begin
 					delay_cnt <= 16'd15*CLK_EN;
 					notready_wait <= 1'b1;
 					// read sector
+				end else if (fd_mfmt) begin
+					// MFMT image: read sector on the bit cells, writes are refused
+					if (cmd[7:5] == 3'b101) begin
+						busy <= 1'b0;
+						irq_set <= 1'b1;
+					end
+					else case (mf_phase)
+						0: begin
+							mf_op <= MF_OP_RSEC;
+							mf_start <= 1'b1;
+							mf_phase <= 1;
+						end
+						1: if (mf_done) begin
+							mf_start <= 1'b0;
+							if (cmd[4] && !mf_rnf && !mf_crc_err) begin
+								// multiple sectors: go on with the next one
+								sector_inc_strobe <= 1'b1;
+								mf_phase <= 2;
+							end else begin
+								RNF <= mf_rnf;
+								busy <= 1'b0;
+								irq_set <= 1'b1;
+								mf_phase <= 0;
+							end
+						end
+						2: mf_phase <= 0;
+						default: mf_phase <= 0;
+					endcase
 				end else begin
 					if(cmd[7:5] == 3'b100) begin
 						if ((sector - sector_base) >= fd_spt) begin
@@ -647,6 +689,27 @@ always @(posedge clkcpu) begin
 					RNF <= 1'b1;
 					busy <= 1'b0; 
 					irq_set <= 1'b1; // emit irq when command done
+				end else if (fd_mfmt) begin
+					// MFMT image: read address / read track on the bit cells
+					if (cmd[7:4] == 4'b1111) begin
+						busy <= 1'b0;                    // write track: write protected
+						irq_set <= 1'b1;
+					end
+					else case (mf_phase)
+						0: begin
+							mf_op <= (cmd[7:4] == 4'b1100) ? MF_OP_RADDR : MF_OP_RTRK;
+							mf_start <= 1'b1;
+							mf_phase <= 1;
+						end
+						1: if (mf_done) begin
+							mf_start <= 1'b0;
+							RNF <= mf_rnf;
+							busy <= 1'b0;
+							irq_set <= 1'b1;
+							mf_phase <= 0;
+						end
+						default: mf_phase <= 0;
+					endcase
 				end else begin
 					// read track TODO: fake
 					if(cmd[7:4] == 4'b1110) begin
@@ -704,6 +767,257 @@ end
 reg data_transfer_start;
 reg data_transfer_done;
 
+
+// -------------------------------------------------------------------------
+// ------------------------ MFMT bit-cell track path -----------------------
+// -------------------------------------------------------------------------
+//
+// For MFMT images (STX converted by Main, see support/st/MFMT.md in
+// Main_MiSTer) the selected drive plays back real MFM cells and the type II
+// and III read commands work on the decoded bytes, like a real WD1772: the
+// IDs, sizes, CRCs, address marks and timings are the ones on the track.
+
+wire        mf_sd_busy, mf_sd_rd, mf_cell_stb, mf_cell, mf_index, mf_loaded;
+wire [31:0] mf_lba;
+wire  [5:0] mf_blk_cnt;
+wire [16:0] mf_position;
+
+reg  [W:0] mf_mountedD;
+always @(posedge clkcpu) mf_mountedD <= img_mounted;
+wire mf_invalidate = |(img_mounted & ~mf_mountedD);
+
+mfmt_track #(
+	.ACC_STEP(16000000 / CLKCPU_KHZ),    // 1/16 ns per clock
+	.INDEX_CLKS(4 * CLKCPU_KHZ)          // 4 ms index pulse
+) mfmt_drive (
+	.clk            ( clkcpu         ),
+	.reset          ( !floppy_reset  ),
+	.enable         ( fd_mfmt && sd_state == SD_IDLE ),
+	.cyl            ( fd_track       ),
+	.head           ( !floppy_side   ),  // ST: side select is active low
+	.drive          ( fdn[0]         ),
+	.invalidate     ( mf_invalidate  ),
+	.sd_lba         ( mf_lba         ),
+	.sd_rd          ( mf_sd_rd       ),
+	.sd_blk_cnt     ( mf_blk_cnt     ),
+	.sd_ack         ( sd_ack         ),
+	.sd_buff_addr   ( sd_buff_addr   ),
+	.sd_dout        ( sd_dout        ),
+	.sd_dout_strobe ( sd_dout_strobe ),
+	.busy           ( mf_sd_busy     ),
+	.cell_stb       ( mf_cell_stb    ),
+	.cell_bit       ( mf_cell        ),
+	.index          ( mf_index       ),
+	.loaded         ( mf_loaded      ),
+	.position       ( mf_position    )
+);
+
+localparam MF_OP_RSEC  = 2'd0;
+localparam MF_OP_RADDR = 2'd1;
+localparam MF_OP_RTRK  = 2'd2;
+
+localparam ME_IDLE = 3'd0, ME_ID = 3'd1, ME_IDF = 3'd2, ME_DAM = 3'd3,
+           ME_DATA = 3'd4, ME_TWAIT = 3'd5, ME_TRK = 3'd6, ME_DONE = 3'd7;
+reg  [2:0] mf_estate;
+
+reg        mf_dec_restart;
+reg  [1:0] mf_dec_mode;
+wire       mf_dec_stb, mf_dec_sync, mf_dec_c2;
+wire [7:0] mf_dec_val;
+
+// read track starts exactly with the cell under the index (cell 0)
+wire mf_trk_start = (mf_estate == ME_TWAIT) && mf_cell_stb && mf_position == 0;
+
+mfm_dec mfm_decoder (
+	.clk       ( clkcpu         ),
+	.restart   ( mf_dec_restart | mf_trk_start ),
+	.mode      ( mf_trk_start ? 2'd2 : mf_dec_mode ),
+	.cell_stb  ( mf_cell_stb    ),
+	.cell_bit  ( mf_cell        ),
+	.byte_stb  ( mf_dec_stb     ),
+	.byte_val  ( mf_dec_val     ),
+	.byte_sync ( mf_dec_sync    ),
+	.byte_c2   ( mf_dec_c2      )
+);
+
+reg        mf_start;           // from the command state machine (level)
+reg  [1:0] mf_op;
+reg        mf_done;
+reg        mf_rnf, mf_crc_err, mf_deleted;
+reg        mf_byte_stb;        // byte for the data register
+reg  [7:0] mf_byte;
+reg        mf_ra_stb;          // read address: track of the ID goes to the sector register
+reg  [7:0] mf_ra_track;
+
+always @(posedge clkcpu) begin
+	reg        startD, indexD;
+	reg  [1:0] syncs;
+	reg  [2:0] n;
+	reg [10:0] cnt;
+	reg  [9:0] budget;
+	reg  [2:0] revs;
+	reg [15:0] crcv;
+	reg  [7:0] id_trk, id_sec;
+	reg  [1:0] id_size;
+	reg        index_rise;
+
+	mf_dec_restart <= 0;
+	mf_byte_stb <= 0;
+	mf_ra_stb <= 0;
+	startD <= mf_start;
+	indexD <= mf_index;
+	index_rise = mf_index && !indexD;
+
+	if (!floppy_reset || cmd_rx || !mf_start) begin
+		mf_estate <= ME_IDLE;
+		mf_done <= 0;
+		mf_dec_mode <= 2'd0;
+	end
+	else case (mf_estate)
+	ME_IDLE:
+		if (!startD) begin
+			mf_rnf <= 0;
+			mf_crc_err <= 0;
+			mf_deleted <= 0;
+			mf_done <= 0;
+			revs <= 0;
+			syncs <= 0;
+			mf_dec_mode <= 2'd0;      // address mark search
+			mf_dec_restart <= 1;
+			mf_estate <= (mf_op == MF_OP_RTRK) ? ME_TWAIT : ME_ID;
+		end
+
+	// ---- look for an ID field: A1 A1 A1 FE
+	ME_ID: begin
+		if (index_rise) begin
+			revs <= revs + 1'd1;
+			// read sector: 5 turns, read address: 6 turns, then record not found
+			if (revs + 1'd1 == ((mf_op == MF_OP_RADDR) ? 3'd6 : 3'd5)) begin
+				mf_rnf <= 1;
+				mf_estate <= ME_DONE;
+			end
+		end
+		if (mf_dec_stb) begin
+			if (mf_dec_sync) begin
+				if (syncs != 3) syncs <= syncs + 1'd1;
+			end
+			else begin
+				if (syncs == 3 && mf_dec_val == 8'hFE) begin
+					crcv <= crc(16'hCDB4, 8'hFE);   // CRC of A1 A1 A1 is CDB4
+					n <= 0;
+					mf_dec_mode <= 2'd1;          // field
+					mf_estate <= ME_IDF;
+				end
+				syncs <= 0;
+			end
+		end
+	end
+
+	// ---- the 6 bytes of the ID field
+	ME_IDF:
+		if (mf_dec_stb) begin
+			crcv <= crc(crcv, mf_dec_val);
+			n <= n + 1'd1;
+			case (n)
+				0: id_trk <= mf_dec_val;
+				2: id_sec <= mf_dec_val;
+				3: id_size <= mf_dec_val[1:0];
+				default: ;
+			endcase
+			if (mf_op == MF_OP_RADDR) begin
+				mf_byte <= mf_dec_val;
+				mf_byte_stb <= 1;
+			end
+			if (n == 5) begin
+				mf_dec_mode <= 2'd0;
+				syncs <= 0;
+				if (mf_op == MF_OP_RADDR) begin
+					mf_crc_err <= crc(crcv, mf_dec_val) != 0;
+					mf_ra_track <= id_trk;
+					mf_ra_stb <= 1;
+					mf_estate <= ME_DONE;
+				end
+				else if (crc(crcv, mf_dec_val) != 0) begin
+					// bad ID: remember it and keep searching
+					if (id_trk == track && id_sec == sector) mf_crc_err <= 1;
+					mf_estate <= ME_ID;
+				end
+				else if (id_trk == track && id_sec == sector) begin
+					mf_crc_err <= 0;
+					budget <= 10'd688;        // the data mark must follow within 43 bytes
+					mf_estate <= ME_DAM;
+				end
+				else mf_estate <= ME_ID;
+			end
+		end
+
+	// ---- data address mark: A1 A1 A1 F8..FB
+	ME_DAM: begin
+		if (mf_cell_stb) begin
+			if (budget == 0) begin
+				syncs <= 0;
+				mf_estate <= ME_ID;
+			end
+			else budget <= budget - 1'd1;
+		end
+		if (mf_dec_stb) begin
+			if (mf_dec_sync) begin
+				if (syncs != 3) syncs <= syncs + 1'd1;
+			end
+			else begin
+				if (syncs == 3 && mf_dec_val[7:2] == 6'b111110) begin
+					mf_deleted <= !mf_dec_val[1];  // F8/F9 deleted data, FA/FB data
+					crcv <= crc(16'hCDB4, mf_dec_val);
+					cnt <= 11'd128 << id_size;
+					n <= 0;
+					mf_dec_mode <= 2'd1;
+					mf_estate <= ME_DATA;
+				end
+				syncs <= 0;
+			end
+		end
+	end
+
+	// ---- data bytes, then 2 CRC bytes
+	ME_DATA:
+		if (mf_dec_stb) begin
+			crcv <= crc(crcv, mf_dec_val);
+			if (cnt != 0) begin
+				cnt <= cnt - 1'd1;
+				mf_byte <= mf_dec_val;
+				mf_byte_stb <= 1;
+			end
+			else begin
+				n <= n + 1'd1;
+				if (n == 1) begin
+					mf_crc_err <= crc(crcv, mf_dec_val) != 0;
+					mf_dec_mode <= 2'd0;
+					mf_estate <= ME_DONE;
+				end
+			end
+		end
+
+	// ---- read track: from one index pulse to the next
+	ME_TWAIT:
+		if (mf_trk_start) begin
+			mf_dec_mode <= 2'd2;
+			mf_estate <= ME_TRK;
+		end
+	ME_TRK:
+		if (mf_cell_stb && mf_position == 0) begin
+			// back at the index: the byte from this cell is not part of the track
+			mf_dec_mode <= 2'd0;
+			mf_estate <= ME_DONE;
+		end
+		else if (mf_dec_stb) begin
+			mf_byte <= mf_dec_val;
+			mf_byte_stb <= 1;
+		end
+
+	ME_DONE: mf_done <= 1;
+	endcase
+end
+
 // ==================================== FIFO ==================================
 
 // 0.5/1 kB buffer used to receive a sector as fast as possible from from the io
@@ -716,9 +1030,9 @@ reg  [9:0] fifo_sdptr;
 
 always @(*) begin
 	if (sector_size_code == 3)
-		fifo_sdptr = { s_odd, sd_buff_addr };
+		fifo_sdptr = { s_odd, sd_buff_addr[7:0] };
 	else
-		fifo_sdptr = { 1'b0, sd_buff_addr };
+		fifo_sdptr = { 1'b0, sd_buff_addr[7:0] };
 
 	if (sector_size_code == 1)
 		fifo_cpuptr_adj = { 1'b0, (fd_spt[0] & (track[0] ^ !floppy_side)) ^ sector[0], fifo_cpuptr[7:0] };
@@ -732,7 +1046,7 @@ fdc1772_dpram #(10) fifo
 
 	.address_a(fifo_sdptr),
 	.data_a(sd_dout),
-	.wren_a(sd_dout_strobe & sd_ack),
+	.wren_a(sd_dout_strobe & sd_ack & ~mf_sd_busy),
 	.q_a(sd_din),
 
 	.address_b(fifo_cpuptr_adj),
@@ -749,6 +1063,12 @@ localparam SD_WRITE = 2;
 reg [1:0] sd_state;
 reg       sd_card_write;
 reg       sd_card_read;
+reg [W:0] sd_rd_sec;
+
+// the selected drive decides who uses the sd interface
+assign sd_lba     = mf_sd_busy ? mf_lba : sd_lba_sec;
+assign sd_rd      = sd_rd_sec | (mf_sd_rd ? ((W+1)'(1) << fdn) : '0);
+assign sd_blk_cnt = mf_sd_busy ? mf_blk_cnt : 6'd0;
 
 always @(posedge clkcpu) begin
 	reg sd_ackD;
@@ -758,14 +1078,14 @@ always @(posedge clkcpu) begin
 	sd_card_readD <= sd_card_read;
 	sd_card_writeD <= sd_card_write;
 	sd_ackD <= sd_ack;
-	if (sd_ack) {sd_rd, sd_wr} <= 0;
+	if (sd_ack) {sd_rd_sec, sd_wr} <= 0;
 
 	case (sd_state)
 	SD_IDLE:
 	begin
 		s_odd <= 1'b0;
 		if (~sd_card_readD & sd_card_read) begin
-			sd_rd[fdn] <= 1;
+			sd_rd_sec[fdn] <= 1;
 			sd_state <= SD_READ;
 		end
 		else if (~sd_card_writeD & sd_card_write) begin
@@ -780,7 +1100,7 @@ always @(posedge clkcpu) begin
 			sd_state <= SD_IDLE;
 		end else begin
 			s_odd <= 1;
-			sd_rd[fdn] <= 1;
+			sd_rd_sec[fdn] <= 1;
 		end
 	end
 
@@ -861,6 +1181,14 @@ always @(posedge clkcpu) begin
 		if(cmd[7:5] == 3'b101) drq_set <= !data_in_valid;
 	end
 
+	// MFMT path: every decoded byte goes to the data register at the disk's pace
+	if (cmd_rx) data_lost <= 1'b0;
+	if (mf_byte_stb) begin
+		data_out <= mf_byte;
+		if (drq) data_lost <= 1'b1;
+		drq_set <= 1'b1;
+	end
+
 	// advance fifo pointer when the write sector data consumed
 	data_in_strobe <= 1'b0;
 	if(cmd[7:5] == 3'b101 && data_in_strobe) fifo_cpuptr <= fifo_cpuptr + 1'd1;
@@ -909,9 +1237,9 @@ end
 // the status byte
 wire [7:0] status = { (MODEL == 1 || MODEL == 3) ? !floppy_ready : motor_on,
 		      (cmd[7:5] == 3'b101 || cmd[7:4] == 4'b1111 || cmd_type_1) && fd_writeprot, // wrprot (only for write!)
-		      cmd_type_1?motor_spin_up_done:1'b0,  // data mark
+		      cmd_type_1?motor_spin_up_done:(fd_mfmt && cmd_type_2 && mf_deleted), // spin-up / record type
 		      RNF,                                 // seek error/record not found
-		      1'b0,                                // crc error
+		      !cmd_type_1 && fd_mfmt && mf_crc_err, // crc error
 		      cmd_type_1?fd_track0:data_lost,      // track0/data lost
 		      cmd_type_1?~fd_index:drq,            // index mark/drq
 		      busy } /* synthesis keep */;
@@ -1032,6 +1360,7 @@ always @(posedge clkcpu) begin
 		end
 
 		if (sector_inc_strobe) sector <= sector + 1'd1;
+		if (mf_ra_stb) sector <= mf_ra_track;
 		if (track_inc_strobe) track <= track + 1'd1;
 		if (track_dec_strobe) track <= track - 1'd1;
 		if (track_clear_strobe) track <= 8'd0;

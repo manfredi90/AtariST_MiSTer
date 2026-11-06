@@ -1,0 +1,54 @@
+name: Build core
+
+# Compiles the core with Quartus 17.0.2 Lite (the version MiSTer uses) on every
+# push to the st-stx branch, then stores the .rbf and the Quartus reports on
+# the build-output branch, so they can be fetched with plain git.
+on:
+  push:
+    branches: [ "st-stx" ]
+    paths: [ "rtl/**", "sys/**", "*.sv", "*.qsf", "*.qpf", "*.sdc", "files.qip", ".github/workflows/build.yml" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile with Quartus 17.0.2 Lite
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/project -w /project \
+            theypsilon/quartus-lite-c5:17.0.2 \
+            quartus_sh --flow compile AtariST.qpf
+
+      - name: Collect output
+        if: always()
+        run: |
+          mkdir -p out
+          ls -l output_files || true
+          if [ -f output_files/AtariST.rbf ]; then
+            cp output_files/AtariST.rbf "out/AtariST_stx_$(date +%Y%m%d)_${GITHUB_SHA::7}.rbf"
+          fi
+          cp output_files/*.rpt output_files/*.summary out/ 2>/dev/null || true
+          echo "${GITHUB_SHA}" > out/COMMIT
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: AtariST-build
+          path: out
+
+      - name: Push to build-output branch
+        if: always()
+        run: |
+          cd out
+          git init -q
+          git checkout -q -b build-output
+          git add -A
+          git -c user.name="github-actions" -c user.email="github-actions@users.noreply.github.com" \
+            commit -q -m "Build output of ${GITHUB_SHA::7} (run ${GITHUB_RUN_ID})"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" build-output

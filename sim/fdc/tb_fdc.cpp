@@ -1,0 +1,382 @@
+// tb_fdc.cpp - Verilator test of the whole fdc1772 with an MFMT (STX) image
+//
+// The C++ side is Main (it serves MFMT tracks converted with Main's code)
+// and the ST (it drives the WD1772 registers like TOS and the DMA: commands,
+// DRQ data reads, status after the interrupt). For every track it checks:
+//   - read address: every STX ID is returned, with its CRC status
+//   - read sector: data, CRC error, record not found, deleted data, timing
+//   - read track: same bytes as the software WD1772 model
+//
+// Usage: tb_fdc [-t cyl head] [-n every] [-v] file.stx...
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <map>
+#include <set>
+#include <vector>
+#include <string>
+#include "Vfdc1772.h"
+#include "verilated.h"
+#include "st_stx.h"
+#include "wdsim.h"
+
+// The clock is always 32 MHz (31.25 ns per tick, clk8m_en every 4 ticks).
+// CLKCPU_KHZ is the value given to the core's MFMT drive: below 32000 the
+// disk turns faster than real by 32000 / CLKCPU_KHZ, to test many tracks.
+#ifndef CLKCPU_KHZ
+#define CLKCPU_KHZ 32000
+#endif
+static const double NS_PER_TICK = 31.25;
+static const double DISK_SCALE = 32000.0 / CLKCPU_KHZ;
+
+static Vfdc1772 *top;
+static uint64_t ticks;
+static int verbose = 0;
+
+struct Track { std::vector<uint8_t> meta, cells; };
+static const StxImage *g_img;
+static std::map<int, Track> cache;
+
+static const Track &get_track(int cyl, int head)
+{
+	int key = cyl * 2 + head;
+	auto it = cache.find(key);
+	if (it != cache.end()) return it->second;
+	Track t;
+	t.meta.resize(ST_MFMT_META_BYTES);
+	t.cells.resize(ST_MFMT_CELLS_BYTES);
+	TrackBuilder tb;
+	stx_build_track(*g_img, cyl, head, tb);
+	tb.encode(cyl, head, t.meta.data(), t.cells.data());
+	return cache[key] = t;
+}
+
+// ---- Main side: hps_io sd emulation ----
+static struct { int state = 0, wait = 0; std::vector<uint16_t> words; size_t i = 0; } sd;
+
+static void sd_step()
+{
+	top->sd_dout_strobe = 0;
+	switch (sd.state)
+	{
+	case 0:
+		if (top->sd_rd)
+		{
+			uint32_t lba = top->sd_lba;
+			int nwords = (top->sd_blk_cnt + 1) * 256;
+			sd.words.assign(nwords, 0);
+			if (lba & 0x80000000u)
+			{
+				const Track &t = get_track(lba & 0xFF, (lba >> 8) & 1);
+				const std::vector<uint8_t> &src = ((lba >> 16) & 3) ? t.cells : t.meta;
+				memcpy(sd.words.data(), src.data(), std::min(src.size(), (size_t)nwords * 2));
+			}
+			else printf("  unexpected sector request lba %u\n", lba);
+			top->sd_ack = 1;
+			sd.state = 1; sd.wait = 20;
+		}
+		break;
+	case 1: if (--sd.wait == 0) { sd.state = 2; sd.i = 0; } break;
+	case 2:
+		if (ticks % 3 == 0)
+		{
+			if (sd.i < sd.words.size())
+			{
+				top->sd_buff_addr = (uint16_t)sd.i;
+				top->sd_dout = sd.words[sd.i++];
+				top->sd_dout_strobe = 1;
+			}
+			else { sd.state = 3; sd.wait = 5; }
+		}
+		break;
+	case 3: if (--sd.wait == 0) { top->sd_ack = 0; sd.state = 0; } break;
+	}
+}
+
+static void tick()
+{
+	sd_step();
+	top->clk8m_en = (ticks % 4) == 0;
+	top->clkcpu = 0; top->eval();
+	top->clkcpu = 1; top->eval();
+	ticks++;
+}
+static void ticks_n(int n) { while (n--) tick(); }
+
+// ---- ST side: register access ----
+enum { R_CMD = 0, R_TRACK = 1, R_SECTOR = 2, R_DATA = 3 };
+
+static void wr(int reg, uint8_t v)
+{
+	top->cpu_addr = reg; top->cpu_din = v; top->cpu_rw = 0; top->cpu_sel = 1;
+	ticks_n(8);
+	top->cpu_sel = 0; top->cpu_rw = 1;
+	ticks_n(8);
+}
+
+static uint8_t rd(int reg)
+{
+	top->cpu_addr = reg; top->cpu_rw = 1; top->cpu_sel = 1;
+	ticks_n(2);
+	uint8_t v = top->cpu_dout;
+	ticks_n(2);
+	top->cpu_sel = 0;
+	ticks_n(2);
+	return v;
+}
+
+struct Cmd
+{
+	uint8_t status = 0;
+	bool timeout = false;
+	std::vector<uint8_t> data;
+	std::vector<uint64_t> when;
+};
+
+// issue a command, read data at every DRQ, stop at the interrupt
+static Cmd run(uint8_t cmd, double max_ms)
+{
+	Cmd c;
+	wr(R_CMD, cmd);
+	uint64_t limit = ticks + (uint64_t)(max_ms * 1e6 / NS_PER_TICK);
+	while (!top->irq)
+	{
+		if (top->drq)
+		{
+			uint64_t t = ticks;
+			c.data.push_back(rd(R_DATA));
+			c.when.push_back(t);
+		}
+		else tick();
+		if (ticks > limit) { c.timeout = true; break; }
+	}
+	c.status = rd(R_CMD);
+	return c;
+}
+
+static double ms_to_disk(double ms) { return ms / DISK_SCALE; }   // real ms -> simulated ms
+
+static int check_track(int cyl, int head, int &cur_cyl)
+{
+	const StxTrack *t = g_img->find(cyl, head);
+	const Track &tr = get_track(cyl, head);
+	const st_mfmt_header *h = (const st_mfmt_header *)tr.meta.data();
+	bool formatted = h->flags & ST_MFMT_F_FORMATTED;
+	int fails = 0;
+	std::string why;
+	auto fail = [&](const char *fmt, int a = 0, int b = 0, int c2 = 0) {
+		char m[160]; snprintf(m, sizeof(m), fmt, a, b, c2); why += " "; why += m; fails++;
+	};
+
+	// seek (h=1: no spin-up wait, 6 ms steps, no verify)
+	top->floppy_side = head ? 0 : 1;      // ST side select is active low
+	if (cyl != cur_cyl)
+	{
+		wr(R_DATA, cyl);
+		Cmd s = run(0x18, 2000);
+		if (s.timeout) { printf("c%02d h%d: seek timeout\n", cyl, head); return 1; }
+		cur_cyl = cyl;
+	}
+	// let the drive load the track (a real program waits for the head to settle)
+	ticks_n((int)(30e6 / NS_PER_TICK));
+
+	int ns = t ? (int)t->sectors.size() : 0;
+	const double rev_ms = 200.0;
+
+	// ---- read address: collect IDs for a bit more than one turn
+	std::map<std::vector<uint8_t>, int> seen;   // id -> status bits
+	int ra = 0;
+	if (formatted && ns)
+	{
+		for (int i = 0; i < ns + 2; i++)
+		{
+			Cmd c = run(0xC8, ms_to_disk(rev_ms * 7));
+			if (c.timeout) { fail("read address timeout"); break; }
+			if (c.status & 0x10) { fail("read address RNF"); break; }
+			if (c.data.size() != 6) { fail("read address %d bytes", (int)c.data.size()); break; }
+			seen[c.data] = c.status & 0x08;
+			if (rd(R_SECTOR) != c.data[0]) fail("read address: sector reg %d, ID track %d", rd(R_SECTOR), c.data[0]);
+			ra++;
+		}
+		for (auto &sec : t->sectors)
+		{
+			std::vector<uint8_t> id(sec.id, sec.id + 6);
+			bool id_err = (sec.status & STX_SECT_RNF) && (sec.status & STX_SECT_CRC_ERROR);
+			bool found = false;
+			for (auto &kv : seen)
+				if (!memcmp(kv.first.data(), sec.id, 4) && (id_err || !memcmp(kv.first.data() + 4, sec.id + 4, 2)))
+				{
+					found = true;
+					if (!!kv.second != id_err) fail("ID %02x: CRC bit %d, STX %d", sec.id[2], !!kv.second, id_err);
+				}
+			if (!found) fail("ID %02x.%02x not returned by read address", sec.id[0], sec.id[2]);
+		}
+	}
+
+	// ---- read sector for every distinct track/sector pair of the STX
+	int rs = 0, rs_ok = 0;
+	double max_terr = 0;
+	std::set<int> done;
+	for (int s = 0; s < ns; s++)
+	{
+		const StxSector &sec = t->sectors[s];
+		int key = sec.id[0] * 256 + sec.id[2];
+		if (done.count(key)) continue;
+		done.insert(key);
+
+		// the WD1772 can return any sector with this track/sector pair and a good ID CRC
+		std::vector<const StxSector *> cand;
+		for (auto &x : t->sectors)
+			if (x.id[0] == sec.id[0] && x.id[2] == sec.id[2] && !((x.status & STX_SECT_RNF) && (x.status & STX_SECT_CRC_ERROR)))
+				cand.push_back(&x);
+		bool any_data = false;
+		for (auto *x : cand) if (!(x->status & STX_SECT_RNF)) any_data = true;
+
+		wr(R_TRACK, sec.id[0]);
+		wr(R_SECTOR, sec.id[2]);
+		Cmd c = run(0x88, ms_to_disk(rev_ms * 7));
+		rs++;
+		if (c.timeout) { fail("read sector %02x timeout", sec.id[2]); continue; }
+
+		if (!any_data)
+		{
+			if (!(c.status & 0x10)) fail("sector %02x: expected RNF, status %02x", sec.id[2], c.status);
+			else rs_ok++;
+			continue;
+		}
+		if (c.status & 0x10) { fail("sector %02x: RNF (status %02x)", sec.id[2], c.status); continue; }
+
+		const StxSector *m = nullptr;
+		for (auto *x : cand)
+		{
+			if (x->status & STX_SECT_RNF || (int)c.data.size() != x->size) continue;
+			bool eq = true;
+			for (int i = 0; i < x->size && eq; i++)
+			{
+				uint8_t mk = x->fuzzy ? x->fuzzy[i] : 0xFF;
+				if ((c.data[i] & mk) != (x->data[i] & mk)) eq = false;
+			}
+			if (eq) { m = x; break; }
+		}
+		if (!m) { fail("sector %02x: data matches no STX sector (%d bytes)", sec.id[2], (int)c.data.size()); continue; }
+
+		bool exp_crc = (m->status & STX_SECT_CRC_ERROR) || m->fuzzy;
+		bool exp_del = m->status & STX_SECT_DELETED;
+		if (!!(c.status & 0x08) != exp_crc) fail("sector %02x: CRC bit %d expected %d", sec.id[2], !!(c.status & 0x08), exp_crc);
+		if (!!(c.status & 0x20) != exp_del) fail("sector %02x: record type %d expected %d", sec.id[2], !!(c.status & 0x20), exp_del);
+		if (c.status & 0x04) fail("sector %02x: lost data", sec.id[2]);
+
+		// timing: first to last data byte, in real time
+		double meas = (c.when.back() - c.when.front()) * NS_PER_TICK * DISK_SCALE;
+		double exp = 0;
+		bool timed = m->timing || m->read_time;
+		for (int i = 1; i < m->size; i++)
+		{
+			double bt = 0;
+			if (m->timing)
+			{
+				int blk = i >> 4;
+				uint16_t v = (uint16_t)((m->timing[blk * 2] << 8) | m->timing[blk * 2 + 1]);
+				bt = (v * 32.0 + 28.0) * 125.0 / 16.0;
+			}
+			else if (m->read_time) bt = m->read_time * 1000.0 / m->size;
+			else bt = h->rev_time_ns / (h->cell_count / 16.0);
+			exp += bt;
+		}
+		double terr = fabs(meas - exp) / exp * 100.0;
+		if (timed && verbose) printf("  sector %02x timed: %.1f us, expected %.1f us\n", sec.id[2], meas / 1000, exp / 1000);
+		if (timed && terr > max_terr) max_terr = terr;
+		if (timed && terr > 0.3) fail("sector %02x: %d us, expected %d us", sec.id[2], (int)(meas / 1000), (int)(exp / 1000));
+		rs_ok++;
+	}
+
+	// ---- read track
+	double rt_pct = -1;
+	if (formatted)
+	{
+		Cmd c = run(0xE8, ms_to_disk(rev_ms * 3));
+		if (c.timeout) fail("read track timeout");
+		else
+		{
+			WdSim wd;
+			std::string err;
+			wd.load(tr.meta.data(), tr.cells.data(), err);
+			wd.spin(3, 7);
+			auto ref = wd.read_track(wd.cells_per_rev());
+			size_t n = std::min(ref.size(), c.data.size()), eq = 0;
+			for (size_t i = 0; i < n; i++) if (ref[i] == c.data[i]) eq++;
+			rt_pct = 100.0 * eq / ref.size();
+			bool weak = h->weak_count > 0;
+			if (c.data.size() != ref.size() && !weak) fail("read track %d bytes, model %d", (int)c.data.size(), (int)ref.size());
+			if (rt_pct < (weak ? 90.0 : 100.0)) fail("read track matches %d %%", (int)rt_pct);
+			if (c.status & 0x04) fail("read track lost data");
+		}
+	}
+
+	if (verbose || fails)
+		printf("c%02d h%d: %s ids=%zu/%d rsec=%d/%d max_terr=%.2f%% rtrack=%.1f%%%s %s\n", cyl, head,
+			formatted ? "fmt" : "noise", seen.size(), ns, rs_ok, rs, max_terr, rt_pct, why.c_str(), fails ? "FAIL" : "ok");
+	return fails ? 1 : 0;
+}
+
+int main(int argc, char **argv)
+{
+	Verilated::commandArgs(argc, argv);
+	top = new Vfdc1772;
+	int only_c = -1, only_h = -1, every = 1, fails = 0;
+	std::vector<const char *> files;
+	for (int i = 1; i < argc; i++)
+	{
+		if (!strcmp(argv[i], "-t") && i + 2 < argc) { only_c = atoi(argv[++i]); only_h = atoi(argv[++i]); }
+		else if (!strcmp(argv[i], "-n") && i + 1 < argc) every = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-v")) verbose = 1;
+		else if (argv[i][0] != '+') files.push_back(argv[i]);
+	}
+	for (const char *f : files)
+	{
+		FILE *fp = fopen(f, "rb");
+		if (!fp) { perror(f); return 2; }
+		std::vector<uint8_t> buf;
+		fseek(fp, 0, SEEK_END); buf.resize(ftell(fp)); fseek(fp, 0, SEEK_SET);
+		if (fread(buf.data(), 1, buf.size(), fp) != buf.size()) return 2;
+		fclose(fp);
+		StxImage img;
+		if (!img.parse(buf.data(), buf.size())) { printf("%s: %s\n", f, img.error()); return 2; }
+		g_img = &img;
+		cache.clear();
+
+		// power on, mount the image on drive A, select it
+		top->floppy_reset = 0; top->cpu_sel = 0; top->cpu_rw = 1;
+		top->floppy_drive = 2;     // drive A (active low)
+		top->floppy_side = 1;
+		top->img_wp = 0; top->img_mfmt = 0; top->img_size = 0; top->img_mounted = 0;
+		ticks_n(100);
+		top->floppy_reset = 1;
+		ticks_n(100);
+		top->img_size = (uint32_t)buf.size(); top->img_mfmt = 1; top->img_mounted = 1;
+		ticks_n(4);
+		top->img_mounted = 0;
+		ticks_n(100);
+
+		int cur = -1;
+		Cmd r = run(0x08, 3000);   // restore, no spin-up wait
+		if (r.timeout) { printf("%s: restore timeout\n", f); return 1; }
+		cur = 0;
+
+		int ff = 0, ft = 0;
+		for (int c = 0; c < img.cylinders(); c++)
+			for (int h = 0; h < img.heads(); h++)
+			{
+				if (only_c >= 0 && (c != only_c || h != only_h)) continue;
+				if (only_c < 0 && (c % every) && !(c >= 78)) continue;   // always test the last tracks
+				ff += check_track(c, h, cur);
+				ft++;
+			}
+		printf("%s: %d/%d tracks ok (clkcpu %d kHz, disk x%.0f)\n", f, ft - ff, ft, CLKCPU_KHZ, DISK_SCALE);
+		fails += ff;
+	}
+	printf("%s\n", fails ? "SOME TRACKS FAILED" : "all tracks ok");
+	delete top;
+	return fails ? 1 : 0;
+}
