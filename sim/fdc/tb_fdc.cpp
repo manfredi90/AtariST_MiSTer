@@ -554,7 +554,7 @@ static int turrican(int iters, int &cur)
 		run(0x01, 4000); cur = 0;
 		wr(R_DATA, 7); run(0x11, 4000); cur = 7;
 		wr(R_SECTOR, 0);
-		Cmd r0 = run_partial(0x80, 64, 3000, ft);
+		Cmd r0 = run_partial(0x80, 112, 3000, ft);
 		double ft0 = ft * tick_ms;
 		wr(R_SECTOR, 0x10);
 		Cmd r16 = run_partial(0x80, 48, 3000, ft);
@@ -573,8 +573,13 @@ static int turrican(int iters, int &cur)
 			if (!(st & 0x80)) break;
 			ticks_n(200);
 		}
-		bool ok0 = r0.data.size() == 64 && !memcmp(r0.data.data(), s0->data, 64);
-		bool ok16 = r16.data.size() == 48 && !memcmp(r16.data.data(), s16->data, 48);
+		// the loader's test: sector 0 bytes 64-79 FF and more than 204 of the
+		// 256 bits of bytes 80-111 at 0; sector 16 bytes 0-15 00 and more than
+		// 204 bits of bytes 16-47 at 0
+		auto zeros = [](const std::vector<uint8_t> &v, size_t a, size_t b) {
+			int z = 0; for (size_t i = a; i < b && i < v.size(); i++) z += 8 - __builtin_popcount(v[i]); return z; };
+		bool ok0 = r0.data.size() == 112 && zeros(r0.data, 64, 80) == 0 && zeros(r0.data, 80, 112) > 204;
+		bool ok16 = r16.data.size() == 48 && zeros(r16.data, 0, 16) == 128 && zeros(r16.data, 16, 48) > 204;
 		bool okm = !(st & 0x80);
 		bool ok = ok0 && ok16 && okm && a.data.size() == 512 && !(a.status & 0x1C);
 		printf("turrican %d: c79 s1 %02x/%zu  s0 %s st %02x first %.1f ms  s16 %s st %02x first %.1f ms  motor %s after %d pulses  %s\n", it,
@@ -586,12 +591,162 @@ static int turrican(int iters, int &cur)
 				printf("    %s us :", n); for (size_t i = 0; i < len && i < v.size(); i++) printf(" %02x", v[i]); printf("\n");
 				printf("    %s STX:", n); for (size_t i = 0; i < len; i++) printf(" %02x", ref[i]); printf("\n");
 			};
-			if (!ok0) dump("s0 ", r0.data, s0->data, 64);
+			if (!ok0) dump("s0 ", r0.data, s0->data, 112);
 			if (!ok16) dump("s16", r16.data, s16->data, 48);
 		}
 		if (!ok) fails++;
 	}
 	return fails;
+}
+
+// ---- replay of a Hatari FDC trace (events.py output) ----------------------
+// CPU side actions are replayed in order. Each one waits for the same thing
+// the program waited for in Hatari (the last FDC side event before it: a DMA
+// address step, the end of a command, the motor stop), then for the same
+// delay after it. The ST DMA is modelled: it takes a byte at every DRQ while
+// it is on and its sector count is not 0.
+struct RDma { uint32_t ctrl = 0x80, addr = 0, fifo = 0, cnt = 0, secb = 0; bool on() const { return !(ctrl & 0x40) && !(ctrl & 0x100) && !(ctrl & 0x08) && cnt; } };
+static RDma dma;
+static std::vector<uint8_t> cap;     // bytes of the current type II command
+
+static void rstep()
+{
+	if (top->drq && dma.on())
+	{
+		cap.push_back(rd(R_DATA));
+		if (++dma.fifo == 16) { dma.fifo = 0; dma.addr += 16; }
+		if (++dma.secb == 512) { dma.secb = 0; dma.cnt--; }
+	}
+	else tick();
+}
+
+static int replay(const char *evfile)
+{
+	FILE *f = fopen(evfile, "r");
+	if (!f) { perror(evfile); return 1; }
+	struct E { uint64_t t; char k[8]; long v, v2, line; };
+	std::vector<E> ev;
+	E e;
+	while (fscanf(f, "%lu %7s %ld %ld %ld", &e.t, e.k, &e.v, &e.v2, &e.line) == 5)
+	{
+		ev.push_back(e);
+	}
+	fclose(f);
+	// drop the duplicates (same time, same value, data register selected)
+	{
+		std::vector<E> o; uint32_t ctrl = 0x80;
+		for (auto &x : ev)
+		{
+			if (!strcmp(x.k, "CTRL")) ctrl = x.v;
+			if (!strcmp(x.k, "W8604") && !o.empty() && !strcmp(o.back().k, "W8604") && o.back().t == x.t && o.back().v == x.v && !(ctrl & 0x10) && ((ctrl >> 1) & 3) == 3) continue;
+			o.push_back(x);
+		}
+		ev.swap(o);
+	}
+	auto *R = top->rootp->fdc1772;
+	const double tpc = 4.0 / DISK_SCALE;          // sim ticks per Hatari 8 MHz cycle
+	const uint64_t tmo = (uint64_t)(ms_to_disk(3000) * 1e6 / NS_PER_TICK);
+	uint64_t anchor_T = ticks, anchor_t = 0;
+	int diverg = 0, stat_bad = 0, data_bad = 0, cmds = 0;
+	int cmd_cyl = 0, cmd_sec = 0, cmd_head = 0; bool in_t2 = false; uint8_t cmd_v = 0;
+	auto finish_t2 = [&](long line) {
+		if (!in_t2) return;
+		in_t2 = false;
+		const StxTrack *t = g_img->find(R->mfmt_drive__DOT__key_cyl, cmd_head);
+		// expected: the sectors from cmd_sec on, as many as were transferred
+		std::vector<uint8_t> exp;
+		int s = cmd_sec;
+		while (t && exp.size() < cap.size())
+		{
+			const StxSector *m = nullptr;
+			for (auto &x : t->sectors) if (x.id[0] == cmd_cyl && x.id[2] == s && x.data) { m = &x; break; }
+			if (!m) break;
+			exp.insert(exp.end(), m->data, m->data + m->size);
+			if (!(cmd_v & 0x10)) break;
+			s++;
+		}
+		size_t n = std::min(exp.size(), cap.size()), bad = n;
+		for (size_t i = 0; i < n; i++) if (cap[i] != exp[i]) { bad = i; break; }
+		if (bad != n || exp.size() < cap.size())
+		{
+			data_bad++;
+			printf("  line %ld: cmd %02x c%d h%d s%d: %zu bytes, first difference at %zu (expected %zu bytes)\n", line, cmd_v, cmd_cyl, cmd_head, cmd_sec, cap.size(), bad, exp.size());
+		}
+	};
+	for (size_t i = 0; i < ev.size(); i++)
+	{
+		E &x = ev[i];
+		bool anchor = !strcmp(x.k, "HDMA") || !strcmp(x.k, "HDONE") || !strcmp(x.k, "HMOFF");
+		if (anchor)
+		{
+			uint64_t lim = ticks + tmo;
+			bool ok = true;
+			if (!strcmp(x.k, "HDMA"))
+			{
+				while (((uint32_t)(dma.addr - x.v) & 0xFFFFFF) > 0x8000 && ticks < lim) rstep();
+				ok = ((uint32_t)(dma.addr - x.v) & 0xFFFFFF) <= 0x8000;
+				if (!ok) { diverg++; printf("line %ld: Hatari DMA at %06lx, ours stays at %06x (cnt %u)\n", x.line, x.v, dma.addr, dma.cnt); dma.addr = x.v; }
+			}
+			else if (!strcmp(x.k, "HDONE"))
+			{
+				while (R->busy && ticks < lim) rstep();
+				ok = !R->busy;
+				if (!ok) { diverg++; printf("line %ld: Hatari command done, ours still busy\n", x.line); }
+			}
+			else
+			{
+				while (R->motor_on && ticks < lim) rstep();
+				ok = !R->motor_on;
+				if (!ok) { diverg++; printf("line %ld: Hatari motor off, ours still on\n", x.line); }
+			}
+			anchor_T = ticks; anchor_t = x.t;
+			continue;
+		}
+		uint64_t target = anchor_T + (uint64_t)((x.t - anchor_t) * tpc);
+		while (ticks < target) rstep();
+		anchor_T = ticks; anchor_t = x.t;
+		if (!strcmp(x.k, "SEL"))
+		{
+			top->floppy_side = x.v ? 0 : 1;
+			top->floppy_drive = x.v2 == 0 ? 2 : x.v2 == 1 ? 1 : 3;
+		}
+		else if (!strcmp(x.k, "CTRL"))
+		{
+			if ((dma.ctrl ^ x.v) & 0x100) { dma.cnt = 0; dma.fifo = 0; dma.secb = 0; }
+			dma.ctrl = x.v;
+		}
+		else if (!strcmp(x.k, "DMASET")) { dma.addr = x.v; dma.fifo = 0; }
+		else if (!strcmp(x.k, "W8604"))
+		{
+			if (dma.ctrl & 0x10) { dma.cnt = x.v & 0xFF; dma.secb = 0; }
+			else if (!(dma.ctrl & 0x08))
+			{
+				int reg = (dma.ctrl >> 1) & 3;
+				uint8_t v = x.v & 0xFF;
+				if (reg == 0)
+				{
+					finish_t2(x.line);
+					cmds++;
+					if ((v & 0xC0) == 0x80)
+					{
+						in_t2 = true; cmd_v = v; cap.clear();
+						cmd_cyl = R->track; cmd_sec = R->sector; cmd_head = !top->floppy_side;
+					}
+					if (verbose) printf("line %ld: cmd %02x tr %d sec %d side %d\n", x.line, v, R->track, R->sector, !top->floppy_side);
+				}
+				wr(reg, v);
+			}
+		}
+		else if (!strcmp(x.k, "RSTAT"))
+		{
+			uint8_t st = rd(R_CMD);
+			// the index bit depends on where the disk is: not compared
+			if ((st & ~0x02) != (x.v & ~0x02)) { stat_bad++; printf("line %ld: status ours %02x, Hatari %02lx\n", x.line, st, x.v); }
+		}
+	}
+	finish_t2(0);
+	printf("replay: %d commands, %d divergences, %d status differences, %d data differences\n", cmds, diverg, stat_bad, data_bad);
+	return diverg + stat_bad + data_bad;
 }
 
 int main(int argc, char **argv)
@@ -600,12 +755,14 @@ int main(int argc, char **argv)
 	Verilated::commandArgs(argc, argv);
 	top = new Vfdc1772;
 	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0;
+	const char *replay_f = nullptr;
 	std::vector<const char *> files;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "-t") && i + 2 < argc) { only_c = atoi(argv[++i]); only_h = atoi(argv[++i]); }
 		else if (!strcmp(argv[i], "-n") && i + 1 < argc) every = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-stress") && i + 1 < argc) stress_n = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-replay") && i + 1 < argc) replay_f = argv[++i];
 		else if (!strcmp(argv[i], "-turrican") && i + 1 < argc) turr_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-lat") && i + 1 < argc) sd_latency_max = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
 		else if (!strcmp(argv[i], "-v")) verbose = 1;
@@ -645,6 +802,11 @@ int main(int argc, char **argv)
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
 
+		if (replay_f)
+		{
+			fails += replay(replay_f);
+			continue;
+		}
 		if (turr_n)
 		{
 			int tf = turrican(turr_n, cur);
