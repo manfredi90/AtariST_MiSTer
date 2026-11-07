@@ -756,7 +756,7 @@ int main(int argc, char **argv)
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	Verilated::commandArgs(argc, argv);
 	top = new Vfdc1772;
-	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0;
+	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0, rt_c = -1;
 	const char *replay_f = nullptr;
 	std::vector<const char *> files;
 	for (int i = 1; i < argc; i++)
@@ -764,6 +764,7 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "-t") && i + 2 < argc) { only_c = atoi(argv[++i]); only_h = atoi(argv[++i]); }
 		else if (!strcmp(argv[i], "-n") && i + 1 < argc) every = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-stress") && i + 1 < argc) stress_n = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-rt") && i + 1 < argc) rt_c = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-replay") && i + 1 < argc) replay_f = argv[++i];
 		else if (!strcmp(argv[i], "-turrican") && i + 1 < argc) turr_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-lat") && i + 1 < argc) sd_latency_max = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
@@ -823,6 +824,16 @@ int main(int argc, char **argv)
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
 
+		if (rt_c >= 0)
+		{
+			for (int k = 0; k < 3; k++)
+			{
+				wr(R_DATA, (uint8_t)(rt_c - k)); Cmd sk = run(0x15, 4000);
+				Cmd t = run(0xE4, 4000);
+				printf("seek %d status %02x, read track %zu bytes, status %02x%s\n", rt_c - k, sk.status, t.data.size(), t.status, t.timeout ? " TIMEOUT" : "");
+			}
+			continue;
+		}
 		if (replay_f)
 		{
 			fails += replay(replay_f);
