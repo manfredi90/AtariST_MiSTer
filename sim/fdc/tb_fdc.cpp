@@ -829,8 +829,22 @@ int main(int argc, char **argv)
 			for (int k = 0; k < 3; k++)
 			{
 				wr(R_DATA, (uint8_t)(rt_c - k)); Cmd sk = run(0x15, 4000);
-				Cmd t = run(0xE4, 4000);
-				printf("seek %d status %02x, read track %zu bytes, status %02x%s\n", rt_c - k, sk.status, t.data.size(), t.status, t.timeout ? " TIMEOUT" : "");
+				// like TOS's VBL routine: drive B selected for a moment while the read track runs
+				wr(R_CMD, 0xE4);
+				Cmd t;
+				uint64_t t0 = ticks, sel_at = ticks + (uint64_t)(ms_to_disk(80) * 1e6 / NS_PER_TICK);
+				bool flipped = false;
+				while (!top->irq && ticks - t0 < (uint64_t)(ms_to_disk(4000) * 1e6 / NS_PER_TICK))
+				{
+					if (!flipped && ticks >= sel_at)
+					{
+						flipped = true;
+						top->floppy_drive = 1; ticks_n((uint64_t)(0.13e6 / NS_PER_TICK)); top->floppy_drive = 2;
+					}
+					if (top->drq) t.data.push_back(rd(R_DATA)); else tick();
+				}
+				t.status = rd(R_CMD);
+				printf("seek %d status %02x, read track %zu bytes, status %02x (drive B selected for 130 us during it)\n", rt_c - k, sk.status, t.data.size(), t.status);
 			}
 			continue;
 		}

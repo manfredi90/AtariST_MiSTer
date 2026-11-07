@@ -325,6 +325,19 @@ wire       fd_sector_hdr  = fd_any ? fdn_sector_hdr[fdn]  : 1'b0;
 //wire     fd_sector_data = fd_any ? fdn_sector_data[fdn] : 1'b0;
 wire       fd_dclk_en     = fd_any ? fdn_dclk[fdn]        : 1'b0;
 wire       fd_present     = fd_any ? fdn_present[fdn]     : 1'b0;
+
+// A command ends with record not found only once no disk has been seen for
+// 6 ms. TOS's VBL routine selects drive B for a moment every 16 VBLs, even
+// while a loader's command runs on drive A (Ghouls'n Ghosts' read track):
+// ending that command at once raised an interrupt that TOS then cleared by
+// reading the status, and the loader waited for it forever.
+localparam integer GONE_CLKS = 6 * CLKCPU_KHZ;
+reg [18:0] absent_cnt;
+wire       fd_gone = absent_cnt == GONE_CLKS;
+always @(posedge clkcpu) begin
+	if (fd_present) absent_cnt <= 0;
+	else if (!fd_gone) absent_cnt <= absent_cnt + 1'd1;
+end
 // The write protect sensor, as type I commands report it, behaves like a
 // real drive (and like Hatari): protected with no disk and for 200 ms after
 // a mount (the old disk going out), then the state of the new disk. Loaders
@@ -501,11 +514,9 @@ always @(posedge clkcpu) begin
 			// ------------------------ TYPE I -------------------------
 			if(cmd_type_1) begin
 				if(!fd_present) begin
-					// no image selected -> send irq after 6 ms
-					if (!notready_wait) begin
-						delay_cnt <= 16'd6*CLK_EN;
-						notready_wait <= 1'b1;
-					end else begin
+					// no image selected -> irq once the drive has been empty
+					// for 6 ms (a moment on another drive is not an empty one)
+					if (fd_gone) begin
 						RNF <= 1'b1;
 						busy <= 1'b0;
 						irq_set <= 1'b1; // emit irq when command done
@@ -590,11 +601,9 @@ always @(posedge clkcpu) begin
 			// ------------------------ TYPE II -------------------------
 			if(cmd_type_2) begin
 				if(!fd_present) begin
-					// no image selected -> send irq after 6 ms
-					if (!notready_wait) begin
-						delay_cnt <= 16'd6*CLK_EN;
-						notready_wait <= 1'b1;
-					end else begin
+					// no image selected -> irq once the drive has been empty
+					// for 6 ms (a moment on another drive is not an empty one)
+					if (fd_gone) begin
 						RNF <= 1'b1;
 						busy <= 1'b0;
 						irq_set <= 1'b1; // emit irq when command done
@@ -717,10 +726,12 @@ always @(posedge clkcpu) begin
 			// ------------------------ TYPE III -------------------------
 			if(cmd_type_3) begin
 				if(!fd_present) begin
-					// no image selected -> send irq immediately
-					RNF <= 1'b1;
-					busy <= 1'b0; 
-					irq_set <= 1'b1; // emit irq when command done
+					// no image selected -> irq once the drive has been empty for 6 ms
+					if (fd_gone) begin
+						RNF <= 1'b1;
+						busy <= 1'b0;
+						irq_set <= 1'b1; // emit irq when command done
+					end
 				end else if (fd_mfmt) begin
 					// MFMT image: read address / read track on the bit cells
 					if (cmd[7:4] == 4'b1111) begin
