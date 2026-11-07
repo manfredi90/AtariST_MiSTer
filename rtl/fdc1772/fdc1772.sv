@@ -219,10 +219,17 @@ end
 // -------------------------------------------------------------------------
 reg cpu_selD;
 reg cpu_rwD;
+reg [1:0] cpu_addrD;
 always @(posedge clkcpu) begin
 	cpu_rwD <= cpu_sel & ~cpu_rw;
 	cpu_selD <= cpu_sel;
+	cpu_addrD <= cpu_addr;
 end
+
+// a new access also when the register changes with the select held: on the
+// ST the DMA's read of the data register and a CPU access to another
+// register can follow each other with no gap in between
+wire cpu_acc_new = cpu_sel && (!cpu_selD || cpu_addr != cpu_addrD);
 
 wire cpu_we = cpu_sel & ~cpu_rw & ~cpu_rwD;
 
@@ -231,7 +238,7 @@ reg irq_set;
 // floppy_reset and read of status register/write of command register clears irq
 reg cpu_rw_cmdstatus;
 always @(posedge clkcpu)
-  cpu_rw_cmdstatus <= ~cpu_selD && cpu_sel && cpu_addr == FDC_REG_CMDSTATUS;
+  cpu_rw_cmdstatus <= cpu_acc_new && cpu_addr == FDC_REG_CMDSTATUS;
 
 wire irq_clr = !floppy_reset || cpu_rw_cmdstatus;
 
@@ -244,7 +251,7 @@ reg drq_set;
 
 reg cpu_rw_data;
 always @(posedge clkcpu)
-	cpu_rw_data <= ~cpu_selD && cpu_sel && cpu_addr == FDC_REG_DATA;
+	cpu_rw_data <= cpu_acc_new && cpu_addr == FDC_REG_DATA;
 
 // like the real chip (see MAME wd_fdc.cpp) a pending DRQ is dropped when a
 // new command arrives and when a command ends with lost data, so a byte
@@ -1365,7 +1372,9 @@ always @(posedge clkcpu) begin
 
 		// only react if stb just raised
 		if(cpu_we) begin
-			if(cpu_addr == FDC_REG_CMDSTATUS) begin       // command register
+			// like the real chip (and Hatari) a command written while busy is
+			// ignored, only force interrupt gets through
+			if(cpu_addr == FDC_REG_CMDSTATUS && (!busy || cpu_din[7:4] == 4'b1101)) begin       // command register
 				cmd <= cpu_din;
 				cmd_rx_i <= 1'b1;
 				// ------------- TYPE I commands -------------

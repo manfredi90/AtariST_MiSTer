@@ -874,7 +874,21 @@ int main(int argc, char **argv)
 						top->floppy_drive = 2;
 						next = ticks + rnd() % (uint64_t)(ms_to_disk(40) * 1e6 / NS_PER_TICK);
 					}
-					if (top->drq) { rd(R_DATA); bytes++; } else tick();
+					if (top->drq)
+					{
+						if (rnd() % 40 == 0)
+						{
+							// a CPU status read the DMA's data read runs into, no gap
+							// between the two (dma.v: fdc_sel is shared)
+							top->cpu_addr = R_CMD; top->cpu_rw = 1; top->cpu_sel = 1; ticks_n(2);
+							top->cpu_addr = R_DATA; ticks_n(1);
+							top->cpu_addr = R_CMD; ticks_n(2);
+							top->cpu_sel = 0; ticks_n(2);
+						}
+						else rd(R_DATA);
+						bytes++;
+					}
+					else tick();
 				}
 				bool hang = !top->irq;
 				if (hang)
