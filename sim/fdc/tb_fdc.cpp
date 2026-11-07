@@ -798,6 +798,22 @@ int main(int argc, char **argv)
 		int cur = -1;
 		Cmd r = run(0x08, 3000);   // restore, no spin-up wait
 		if (r.timeout) { printf("%s: restore timeout\n", f); return 1; }
+		{
+			// write protect after the mount: protected, not protected,
+			// protected (a disk going out and in), then the image (read-only)
+			std::string seq;
+			int prev = -1;
+			for (int ms = 0; ms < 1000; ms += 5)
+			{
+				int wp = (rd(R_CMD) >> 6) & 1;
+				if (wp != prev) seq += wp ? '1' : '0';
+				prev = wp;
+				ticks_n((uint64_t)(ms_to_disk(5) * 1e6 / NS_PER_TICK));
+			}
+			bool ok = seq == "101";
+			printf("%s: write protect after mount %s %s\n", f, seq.c_str(), ok ? "ok" : "FAIL");
+			if (!ok) fails++;
+		}
 		cur = 0;
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;

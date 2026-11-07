@@ -325,8 +325,39 @@ wire       fd_sector_hdr  = fd_any ? fdn_sector_hdr[fdn]  : 1'b0;
 //wire     fd_sector_data = fd_any ? fdn_sector_data[fdn] : 1'b0;
 wire       fd_dclk_en     = fd_any ? fdn_dclk[fdn]        : 1'b0;
 wire       fd_present     = fd_any ? fdn_present[fdn]     : 1'b0;
+// A real drive changes its write protect signal while a disk goes out and
+// another comes in, and loaders (and TOS) watch it to see a disk change.
+// After a mount the signal is: protected (disk going out), not protected
+// (empty drive), protected (disk coming in), 250 ms each, then the state
+// of the new disk. Without it a swap between two write protected images
+// is not seen (Xenon 2 waiting for its second disk).
+localparam integer WPC_CLKS = 250 * CLKCPU_KHZ;
+reg  [1:0] wpc_phase[FD_NUM];
+reg [24:0] wpc_cnt[FD_NUM];
+always @(posedge clkcpu) begin
+	reg [W:0] mountedD;
+	integer i;
+	mountedD <= img_mounted;
+	for(i = 0; i < FD_NUM; i = i+1'd1) begin
+		if (~mountedD[i] && img_mounted[i]) begin
+			wpc_phase[i] <= 2'd1;
+			wpc_cnt[i] <= 0;
+		end
+		else if (wpc_phase[i] != 2'd0) begin
+			if (wpc_cnt[i] == WPC_CLKS - 1) begin
+				wpc_cnt[i] <= 0;
+				wpc_phase[i] <= (wpc_phase[i] == 2'd3) ? 2'd0 : wpc_phase[i] + 2'd1;
+			end
+			else wpc_cnt[i] <= wpc_cnt[i] + 1'd1;
+		end
+	end
+end
+wire [1:0] fd_wpc_phase   = wpc_phase[fdn];
+
 // MFMT images are read-only for now: writes end with write protect
-wire       fd_writeprot   = fd_any ? (img_wp[fdn] | fd_mfmt) : 1'b1;
+wire       fd_writeprot   = !fd_any ? 1'b1 :
+                            (fd_wpc_phase != 2'd0) ? (fd_wpc_phase != 2'd2) :
+                            (img_wp[fdn] | fd_mfmt);
 
 wire       fd_doubleside  = fdn_doubleside[fdn];
 wire [4:0] fd_spt         = fdn_spt[fdn];
