@@ -890,7 +890,7 @@ int main(int argc, char **argv)
 		}
 		if (rt_c >= 0)
 		{
-			for (int k = 0; k < 3; k++)
+			for (int k = 0; k < (getenv("RTN") ? atoi(getenv("RTN")) : 3); k++)
 			{
 				wr(R_DATA, (uint8_t)(rt_c - k)); Cmd sk = run(0x15, 4000);
 				// like TOS's VBL routine: drive B selected for a moment while the read track runs
@@ -909,7 +909,7 @@ int main(int argc, char **argv)
 				}
 				t.status = rd(R_CMD);
 				printf("seek %d status %02x, read track %zu bytes, status %02x (drive B selected for 130 us during it)\n", rt_c - k, sk.status, t.data.size(), t.status);
-				if (getenv("DBGQ")) dbg_drain();
+				if (getenv("DBGQ") && (getenv("DBGQ")[0] != '2' || k == (getenv("RTN") ? atoi(getenv("RTN")) : 3) - 1)) dbg_drain();
 			}
 			continue;
 		}

@@ -1466,6 +1466,7 @@ reg  [W:0] dbg_mntD;
 reg        dbg_endD;
 
 always @(posedge clkcpu) begin
+	reg dbg_lost_ev;
 	dbg_busyD <= busy;
 	dbg_selD <= {floppy_drive[1:0], floppy_side};
 	dbg_mntD <= img_mounted;
@@ -1478,9 +1479,8 @@ always @(posedge clkcpu) begin
 	if (dbg_pop != dbg_popD && dbg_valid) dbg_rp <= dbg_rp + 1'd1;
 
 	// one entry per clock; a source firing again before it was written replaces itself
-	if (p_cmd || p_end || p_sel || p_irq || p_reg || p_mnt) begin
-		if (dbg_full) dbg_dropped <= dbg_dropped + 1'd1;
-		else begin
+	if ((p_cmd || p_end || p_sel || p_irq || p_reg || p_mnt || dbg_dropped != 0) && !dbg_full) begin
+		begin
 			dbg_wp <= dbg_wp + 1'd1;
 			if (dbg_dropped != 0) begin
 				dbg_mem[dbg_wp] <= {DBG_DROP, dbg_us, 40'd0, dbg_dropped};
@@ -1495,32 +1495,41 @@ always @(posedge clkcpu) begin
 		end
 	end
 
-	// sources (after the writer: a new event wins over clearing its pending flag)
-	if (cpu_we && cpu_addr == FDC_REG_CMDSTATUS) begin
+	// sources (after the writer: a new event wins over clearing its pending flag);
+	// with the queue full they are counted as lost
+	dbg_lost_ev = 0;
+	if ((cpu_we && cpu_addr == FDC_REG_CMDSTATUS) && dbg_full) dbg_lost_ev = 1;
+	else if (cpu_we && cpu_addr == FDC_REG_CMDSTATUS) begin
 		p_cmd <= 1; t_cmd <= dbg_us;
 		v_cmd <= {cpu_din, track, sector, data_in, busy, fd_track, irq, drq, motor_on, 5'd0, 8'd0};
 	end
-	if (cpu_we && cpu_addr != FDC_REG_CMDSTATUS) begin
+	if ((cpu_we && cpu_addr != FDC_REG_CMDSTATUS) && dbg_full) dbg_lost_ev = 1;
+	else if (cpu_we && cpu_addr != FDC_REG_CMDSTATUS) begin
 		p_reg <= 1; t_reg <= dbg_us;
 		v_reg <= {6'd0, cpu_addr, cpu_din, busy, fd_track, 32'd0};
 	end
-	if (dbg_endD) begin
+	if ((dbg_endD) && dbg_full) dbg_lost_ev = 1;
+	else if (dbg_endD) begin
 		p_end <= 1; t_end <= dbg_us;
 		v_end <= {status, track, sector, dbg_bytes, irq, fd_track, 8'd0};
 	end
-	if (dbg_selD != {floppy_drive[1:0], floppy_side}) begin
+	if ((dbg_selD != {floppy_drive[1:0], floppy_side}) && dbg_full) dbg_lost_ev = 1;
+	else if (dbg_selD != {floppy_drive[1:0], floppy_side}) begin
 		p_sel <= 1; t_sel <= dbg_us;
 		v_sel <= {floppy_drive[1:0], floppy_side, fd_present, fd_mfmt, mf_loaded, busy, irq,
 		          cmd, status, 1'b0, fd_track, 7'd0, mf_position};
 	end
-	if (cpu_rw_cmdstatus && cpu_rw && irq) begin
+	if ((cpu_rw_cmdstatus && cpu_rw && irq) && dbg_full) dbg_lost_ev = 1;
+	else if (cpu_rw_cmdstatus && cpu_rw && irq) begin
 		p_irq <= 1; t_irq <= dbg_us;
 		v_irq <= {status, cmd, 40'd0};
 	end
-	if (|(img_mounted & ~dbg_mntD)) begin
+	if ((|(img_mounted & ~dbg_mntD)) && dbg_full) dbg_lost_ev = 1;
+	else if (|(img_mounted & ~dbg_mntD)) begin
 		p_mnt <= 1; t_mnt <= dbg_us;
 		v_mnt <= {6'd0, img_mounted[1:0], 48'd0};
 	end
+	if (dbg_lost_ev && dbg_dropped != 16'hFFFF) dbg_dropped <= dbg_dropped + 1'd1;
 
 end
 
