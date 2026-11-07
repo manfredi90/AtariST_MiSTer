@@ -325,14 +325,14 @@ wire       fd_sector_hdr  = fd_any ? fdn_sector_hdr[fdn]  : 1'b0;
 //wire     fd_sector_data = fd_any ? fdn_sector_data[fdn] : 1'b0;
 wire       fd_dclk_en     = fd_any ? fdn_dclk[fdn]        : 1'b0;
 wire       fd_present     = fd_any ? fdn_present[fdn]     : 1'b0;
-// A real drive changes its write protect signal while a disk goes out and
-// another comes in, and loaders (and TOS) watch it to see a disk change.
-// After a mount the signal is: protected (disk going out), not protected
-// (empty drive), protected (disk coming in), 250 ms each, then the state
-// of the new disk. Without it a swap between two write protected images
-// is not seen (Xenon 2 waiting for its second disk).
-localparam integer WPC_CLKS = 250 * CLKCPU_KHZ;
-reg  [1:0] wpc_phase[FD_NUM];
+// The write protect sensor, as type I commands report it, behaves like a
+// real drive (and like Hatari): protected with no disk and for 200 ms after
+// a mount (the old disk going out), then the state of the new disk. Loaders
+// watch for protected -> not protected to see a new disk (Xenon 2). Images
+// in MFMT (STX) show as not protected, as in Hatari, though writing to them
+// is still refused with a write protect error.
+localparam integer WPC_CLKS = 200 * CLKCPU_KHZ;
+reg        wpc_busy[FD_NUM];
 reg [24:0] wpc_cnt[FD_NUM];
 always @(posedge clkcpu) begin
 	reg [W:0] mountedD;
@@ -340,24 +340,19 @@ always @(posedge clkcpu) begin
 	mountedD <= img_mounted;
 	for(i = 0; i < FD_NUM; i = i+1'd1) begin
 		if (~mountedD[i] && img_mounted[i]) begin
-			wpc_phase[i] <= 2'd1;
+			wpc_busy[i] <= 1'b1;
 			wpc_cnt[i] <= 0;
 		end
-		else if (wpc_phase[i] != 2'd0) begin
-			if (wpc_cnt[i] == WPC_CLKS - 1) begin
-				wpc_cnt[i] <= 0;
-				wpc_phase[i] <= (wpc_phase[i] == 2'd3) ? 2'd0 : wpc_phase[i] + 2'd1;
-			end
-			else wpc_cnt[i] <= wpc_cnt[i] + 1'd1;
+		else if (wpc_busy[i]) begin
+			if (wpc_cnt[i] == WPC_CLKS - 1) wpc_busy[i] <= 1'b0;
+			wpc_cnt[i] <= wpc_cnt[i] + 1'd1;
 		end
 	end
 end
-wire [1:0] fd_wpc_phase   = wpc_phase[fdn];
 
+wire       fd_wp_sense    = !fd_any || wpc_busy[fdn] || !fd_present || img_wp[fdn];
 // MFMT images are read-only for now: writes end with write protect
-wire       fd_writeprot   = !fd_any ? 1'b1 :
-                            (fd_wpc_phase != 2'd0) ? (fd_wpc_phase != 2'd2) :
-                            (img_wp[fdn] | fd_mfmt);
+wire       fd_writeprot   = fd_any ? (img_wp[fdn] | fd_mfmt) : 1'b1;
 
 wire       fd_doubleside  = fdn_doubleside[fdn];
 wire [4:0] fd_spt         = fdn_spt[fdn];
@@ -863,7 +858,12 @@ wire       mf_dec_stb, mf_dec_sync, mf_dec_c2;
 wire [7:0] mf_dec_val;
 
 // read track starts exactly with the cell under the index (cell 0)
-wire mf_trk_start = (mf_estate == ME_TWAIT) && mf_cell_stb && mf_position == 0;
+// read track starts at the index of the track under the head once it is
+// loaded: while Main is still building it (seconds for protected tracks on
+// the ARM) the drive keeps turning with the length of the previous track,
+// and a read track started then returned the wrong number of bytes
+// (Ghouls'n Ghosts checks that its short track 79 gives at most 6020)
+wire mf_trk_start = (mf_estate == ME_TWAIT) && mf_cell_stb && mf_position == 0 && mf_loaded;
 
 mfm_dec mfm_decoder (
 	.clk       ( clkcpu         ),
@@ -1275,7 +1275,7 @@ end
 
 // the status byte
 wire [7:0] status = { (MODEL == 1 || MODEL == 3) ? !floppy_ready : motor_on,
-		      (cmd[7:5] == 3'b101 || cmd[7:4] == 4'b1111 || cmd_type_1) && fd_writeprot, // wrprot (only for write!)
+		      ((cmd[7:5] == 3'b101 || cmd[7:4] == 4'b1111) && fd_writeprot) || (cmd_type_1 && fd_wp_sense), // wrprot (only for write!)
 		      cmd_type_1?motor_spin_up_done:(fd_mfmt && cmd_type_2 && mf_deleted), // spin-up / record type
 		      RNF,                                 // seek error/record not found
 		      !cmd_type_1 && fd_mfmt && mf_crc_err, // crc error

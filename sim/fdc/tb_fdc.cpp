@@ -648,7 +648,7 @@ static int replay(const char *evfile)
 	const uint64_t tmo = (uint64_t)(ms_to_disk(3000) * 1e6 / NS_PER_TICK);
 	uint64_t anchor_T = ticks, anchor_t = 0;
 	int diverg = 0, stat_bad = 0, data_bad = 0, cmds = 0;
-	int cmd_cyl = 0, cmd_sec = 0, cmd_head = 0; bool in_t2 = false; uint8_t cmd_v = 0;
+	int cmd_cyl = 0, cmd_sec = 0, cmd_head = 0; bool in_t2 = false, in_t3 = false; uint8_t cmd_v = 0;
 	auto finish_t2 = [&](long line) {
 		if (!in_t2) return;
 		in_t2 = false;
@@ -725,8 +725,10 @@ static int replay(const char *evfile)
 				uint8_t v = x.v & 0xFF;
 				if (reg == 0)
 				{
+					if (in_t3) { printf("  line %ld: read track c%d: %zu bytes\n", x.line, cmd_cyl, cap.size()); in_t3 = false; }
 					finish_t2(x.line);
 					cmds++;
+					if ((v & 0xF0) == 0xE0) { in_t3 = true; cap.clear(); cmd_cyl = R->track; }
 					if ((v & 0xC0) == 0x80)
 					{
 						in_t2 = true; cmd_v = v; cap.clear();
@@ -795,12 +797,11 @@ int main(int argc, char **argv)
 		top->img_mounted = 0;
 		ticks_n(100);
 
-		int cur = -1;
-		Cmd r = run(0x08, 3000);   // restore, no spin-up wait
-		if (r.timeout) { printf("%s: restore timeout\n", f); return 1; }
 		{
-			// write protect after the mount: protected, not protected,
-			// protected (a disk going out and in), then the image (read-only)
+			// write protect sensor after the mount: protected (the old disk
+			// going out), then the image (STX shows as not protected)
+			wr(R_CMD, 0x08);   // restore: type I status, live while it runs
+			ticks_n(200);
 			std::string seq;
 			int prev = -1;
 			for (int ms = 0; ms < 1000; ms += 5)
@@ -810,10 +811,14 @@ int main(int argc, char **argv)
 				prev = wp;
 				ticks_n((uint64_t)(ms_to_disk(5) * 1e6 / NS_PER_TICK));
 			}
-			bool ok = seq == "101";
+			bool ok = seq == "10";
 			printf("%s: write protect after mount %s %s\n", f, seq.c_str(), ok ? "ok" : "FAIL");
 			if (!ok) fails++;
 		}
+		int cur = -1;
+		Cmd r = run(0x08, 3000);   // restore, no spin-up wait
+		if (r.timeout) { printf("%s: restore timeout\n", f); return 1; }
+
 		cur = 0;
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
