@@ -241,7 +241,11 @@ reg cpu_rw_data;
 always @(posedge clkcpu)
 	cpu_rw_data <= ~cpu_selD && cpu_sel && cpu_addr == FDC_REG_DATA;
 
-wire drq_clr = !floppy_reset || cpu_rw_data;
+// like the real chip (see MAME wd_fdc.cpp) a pending DRQ is dropped when a
+// new command arrives and when a command ends with lost data, so a byte
+// left unread by the CPU never reaches the next transfer
+reg drq_drop;
+wire drq_clr = !floppy_reset || cpu_rw_data || drq_drop;
 
 always @(posedge clkcpu) begin
 	if(drq_clr) drq <= 1'b0;
@@ -1369,6 +1373,13 @@ always @(posedge clkcpu) begin
 		if (track_dec_strobe) track <= track - 1'd1;
 		if (track_clear_strobe) track <= 8'd0;
 	end
+end
+
+// see drq_drop above
+reg busy_drqD;
+always @(posedge clkcpu) begin
+	busy_drqD <= busy;
+	drq_drop <= (cmd_rx && !(cmd_type_4 && busy)) || (busy_drqD && !busy && data_lost);
 end
 
 endmodule

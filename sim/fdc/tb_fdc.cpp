@@ -506,18 +506,107 @@ static int stress(int iters, int &cur)
 	return fails;
 }
 
+
+// Turrican's protection check as Hatari's FDC trace shows it: a read of
+// c79/h1 s1, restore, seek 7, sector 0 then sector 0x10 of c7/h0 with DMA
+// switched off after 64 resp. 48 bytes, seek 79 and status polling until the
+// motor stops. The bytes the loader keeps must be those of the STX sectors.
+static Cmd run_partial(uint8_t cmd, size_t keep, double max_ms, uint64_t &first_t)
+{
+	Cmd c;
+	wr(R_CMD, cmd);
+	uint64_t t0 = ticks, limit = ticks + (uint64_t)(max_ms * 1e6 / NS_PER_TICK);
+	first_t = 0;
+	bool prev = false;
+	while (!top->irq)
+	{
+		bool d = top->drq;
+		if (d && !prev && c.data.size() < keep)
+		{
+			if (!first_t) first_t = ticks - t0;
+			c.data.push_back(rd(R_DATA));
+		}
+		else tick();
+		prev = d && c.data.size() >= keep;
+		if (ticks > limit) { c.timeout = true; break; }
+	}
+	c.status = rd(R_CMD);
+	return c;
+}
+
+static int turrican(int iters, int &cur)
+{
+	const StxTrack *t = g_img->find(7, 0);
+	const StxSector *s0 = nullptr, *s16 = nullptr;
+	if (t) for (auto &s : t->sectors) { if (s.id[2] == 0x00) s0 = &s; if (s.id[2] == 0x10) s16 = &s; }
+	if (!s0 || !s16 || !s0->data || !s16->data) { printf("turrican: sectors 0/0x10 of c7/h0 not found\n"); return 1; }
+	double tick_ms = NS_PER_TICK * DISK_SCALE / 1e6;
+	int fails = 0;
+	for (int it = 0; it < iters; it++)
+	{
+		ticks_n(rnd() % 3000000);
+		uint64_t ft;
+		top->floppy_side = 0;
+		wr(R_DATA, 79); run(0x13, 4000); cur = 79;
+		wr(R_SECTOR, 1);
+		Cmd a = run(0x80, 3000);
+		top->floppy_side = 1;
+		run(0x01, 4000); cur = 0;
+		wr(R_DATA, 7); run(0x11, 4000); cur = 7;
+		wr(R_SECTOR, 0);
+		Cmd r0 = run_partial(0x80, 64, 3000, ft);
+		double ft0 = ft * tick_ms;
+		wr(R_SECTOR, 0x10);
+		Cmd r16 = run_partial(0x80, 48, 3000, ft);
+		double ft16 = ft * tick_ms;
+		wr(R_DATA, 79); run(0x11, 4000); cur = 79;
+		// poll like the loader until the motor bit drops
+		uint64_t lim = ticks + (uint64_t)(ms_to_disk(6000) * 1e6 / NS_PER_TICK);
+		int pulses = 0, prev = 0;
+		uint8_t st = 0;
+		while (ticks < lim)
+		{
+			st = rd(R_CMD);
+			int b = (st >> 1) & 1;
+			if (b && !prev) pulses++;
+			prev = b;
+			if (!(st & 0x80)) break;
+			ticks_n(200);
+		}
+		bool ok0 = r0.data.size() == 64 && !memcmp(r0.data.data(), s0->data, 64);
+		bool ok16 = r16.data.size() == 48 && !memcmp(r16.data.data(), s16->data, 48);
+		bool okm = !(st & 0x80);
+		bool ok = ok0 && ok16 && okm && a.data.size() == 512 && !(a.status & 0x1C);
+		printf("turrican %d: c79 s1 %02x/%zu  s0 %s st %02x first %.1f ms  s16 %s st %02x first %.1f ms  motor %s after %d pulses  %s\n", it,
+			a.status, a.data.size(), ok0 ? "ok" : "BAD", r0.status, ft0, ok16 ? "ok" : "BAD", r16.status, ft16,
+			okm ? "off" : "STILL ON", pulses, ok ? "ok" : "FAIL");
+		if (!ok0 || !ok16)
+		{
+			auto dump = [](const char *n, const std::vector<uint8_t> &v, const uint8_t *ref, size_t len) {
+				printf("    %s us :", n); for (size_t i = 0; i < len && i < v.size(); i++) printf(" %02x", v[i]); printf("\n");
+				printf("    %s STX:", n); for (size_t i = 0; i < len; i++) printf(" %02x", ref[i]); printf("\n");
+			};
+			if (!ok0) dump("s0 ", r0.data, s0->data, 64);
+			if (!ok16) dump("s16", r16.data, s16->data, 48);
+		}
+		if (!ok) fails++;
+	}
+	return fails;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	Verilated::commandArgs(argc, argv);
 	top = new Vfdc1772;
-	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0;
+	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0;
 	std::vector<const char *> files;
 	for (int i = 1; i < argc; i++)
 	{
 		if (!strcmp(argv[i], "-t") && i + 2 < argc) { only_c = atoi(argv[++i]); only_h = atoi(argv[++i]); }
 		else if (!strcmp(argv[i], "-n") && i + 1 < argc) every = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-stress") && i + 1 < argc) stress_n = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-turrican") && i + 1 < argc) turr_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-lat") && i + 1 < argc) sd_latency_max = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
 		else if (!strcmp(argv[i], "-v")) verbose = 1;
 		else if (!strcmp(argv[i], "-st")) { fails += check_st(); }
@@ -556,6 +645,13 @@ int main(int argc, char **argv)
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
 
+		if (turr_n)
+		{
+			int tf = turrican(turr_n, cur);
+			printf("%s: turrican check %d runs, %d failures\n", f, turr_n, tf);
+			fails += tf;
+			continue;
+		}
 		if (stress_n)
 		{
 			int sf = stress(stress_n, cur);
