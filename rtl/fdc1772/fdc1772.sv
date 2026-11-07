@@ -525,7 +525,10 @@ always @(posedge clkcpu) begin
 
 			// ------------------------ TYPE I -------------------------
 			if(cmd_type_1) begin
-				if(!fd_present) begin
+				// drive A is always there, and its head steps with or without a
+				// disk (Xenon 2 seeks while the player swaps disks); an empty
+				// drive B is taken as no drive
+				if(!fd_present && fdn != 0) begin
 					// no image selected -> irq once the drive has been empty
 					// for 6 ms (a moment on another drive is not an empty one)
 					if (fd_gone) begin
@@ -1459,8 +1462,8 @@ always @(posedge clkcpu) begin
 	else dbg_div <= dbg_div + 1'd1;
 end
 
-reg [95:0] dbg_mem[0:63];
-reg  [5:0] dbg_wp = 0, dbg_rp = 0;
+reg [95:0] dbg_mem[0:511];
+reg  [8:0] dbg_wp = 0, dbg_rp = 0;
 reg [15:0] dbg_dropped = 0;
 reg        dbg_popD;
 reg [95:0] dbg_qr;
@@ -1542,7 +1545,7 @@ always @(posedge clkcpu) begin
 	if ((|(img_mounted & ~dbg_mntD)) && dbg_full) dbg_lost_ev = 1;
 	else if (|(img_mounted & ~dbg_mntD)) begin
 		p_mnt <= 1; t_mnt <= dbg_us;
-		v_mnt <= {6'd0, img_mounted[1:0], 48'd0};
+		v_mnt <= {4'd0, img_mfmt, |img_size, img_mounted[1:0], 48'd0};
 	end
 	if (dbg_lost_ev && dbg_dropped != 16'hFFFF) dbg_dropped <= dbg_dropped + 1'd1;
 
