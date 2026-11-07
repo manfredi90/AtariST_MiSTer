@@ -1120,9 +1120,15 @@ reg       sd_card_write;
 reg       sd_card_read;
 reg [W:0] sd_rd_sec;
 
-// the selected drive decides who uses the sd interface
+// the selected drive decides who uses the sd interface. A track request
+// stays on the drive that made it: TOS selects drive B for a moment every
+// 16 VBLs, and a request that moved there was answered by Main as one for
+// the empty drive B, so drive A never got its track and the command waited
+// forever (Ghouls'n Ghosts, Xenon 2)
+reg [WIDX:0] mf_rd_fdn;
+always @(posedge clkcpu) if (!mf_sd_busy) mf_rd_fdn <= fdn;
 assign sd_lba     = mf_sd_busy ? mf_lba : sd_lba_sec;
-assign sd_rd      = sd_rd_sec | (mf_sd_rd ? ((W+1)'(1) << fdn) : '0);
+assign sd_rd      = sd_rd_sec | (mf_sd_rd ? ((W+1)'(1) << mf_rd_fdn) : '0);
 assign sd_blk_cnt = mf_sd_busy ? mf_blk_cnt : 6'd0;
 
 always @(posedge clkcpu) begin

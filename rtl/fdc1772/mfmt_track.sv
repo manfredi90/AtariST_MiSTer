@@ -170,11 +170,17 @@ always @(posedge clk) begin
 		if (sd_ackD && !sd_ack) lstate <= L_DONE;
 
 	L_DONE: begin
-		// the head moved while loading: load again
-		if (!key_match) lstate <= L_IDLE;
+		// the head moved (or another drive got selected) while loading: load
+		// again. The key is dropped, or a selection that comes back to the
+		// same drive and track would find it matching with nothing loaded.
+		if (!key_match) begin
+			key_valid <= 0;
+			lstate <= L_IDLE;
+		end
 		else begin
 			valid <= hdr_ok;
 			load_done <= hdr_ok;
+			key_valid <= hdr_ok;   // a bad answer: ask again
 			lstate <= L_IDLE;
 		end
 	end

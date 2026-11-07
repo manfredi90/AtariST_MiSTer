@@ -58,7 +58,8 @@ static const Track &get_track(int cyl, int head)
 
 // ---- Main side: hps_io sd emulation ----
 static struct { int state = 0, wait = 0; std::vector<uint16_t> words; size_t i = 0; } sd;
-static uint32_t sd_latency_max = 0;     // ticks; random delay before Main answers (real Main polls)
+static uint32_t sd_latency_max = 0;
+static int sd_wrong_drive = 0;        // track requests seen on drive B     // ticks; random delay before Main answers (real Main polls)
 static uint32_t lat_rng = 1;
 static uint32_t rnd() { lat_rng = lat_rng * 1664525u + 1013904223u; return lat_rng >> 8; }
 
@@ -77,10 +78,20 @@ static void sd_step()
 		}
 		else if (top->sd_rd)
 		{
+			// like Main, the request is looked at only when it gets polled
+			sd.state = 5;
+			sd.wait = 20 + (sd_latency_max ? rnd() % sd_latency_max : 0);
+		}
+		break;
+	case 5:
+		if (--sd.wait) break;
+		if (!top->sd_rd) { sd.state = 0; break; }
+		{
 			uint32_t lba = top->sd_lba;
 			int nwords = (top->sd_blk_cnt + 1) * 256;
 			sd.words.assign(nwords, 0);
-			if (lba & 0x80000000u)
+			if (!(top->sd_rd & 1)) { if (lba & 0x80000000u) sd_wrong_drive++; }   // drive B: no image, zeros
+			else if (lba & 0x80000000u)
 			{
 				const Track &t = get_track(lba & 0xFF, (lba >> 8) & 1);
 				const std::vector<uint8_t> &src = ((lba >> 16) & 3) ? t.cells : t.meta;
@@ -92,8 +103,7 @@ static void sd_step()
 				if (off < st_file.size()) memcpy(sd.words.data(), &st_file[off], std::min(st_file.size() - off, (size_t)nwords * 2));
 			}
 			else printf("  unexpected sector request lba %u\n", lba);
-			sd.state = 4;
-			sd.wait = 20 + (sd_latency_max ? rnd() % sd_latency_max : 0);
+			top->sd_ack = 1; sd.state = 1; sd.wait = 20;
 		}
 		break;
 	case 4: if (--sd.wait == 0) { top->sd_ack = 1; sd.state = 1; sd.wait = 20; } break;
@@ -867,6 +877,14 @@ int main(int argc, char **argv)
 					if (top->drq) { rd(R_DATA); bytes++; } else tick();
 				}
 				bool hang = !top->irq;
+				if (hang)
+				{
+					auto *R = top->rootp->fdc1772;
+					printf("    hang cmd %02x: lstate %d valid %d key_valid %d key_cyl %d key_drive %d head %d sd_rd %d sd_ack %d tb_sd %d mf_busy %d sel %d busy %d estate %d sd_state %d\n", c,
+						R->mfmt_drive__DOT__lstate, R->mfmt_drive__DOT__valid, R->mfmt_drive__DOT__key_valid,
+						R->mfmt_drive__DOT__key_cyl, R->mfmt_drive__DOT__key_drive, R->mfmt_drive__DOT__key_head, top->sd_rd, top->sd_ack, sd.state, R->mf_sd_busy,
+						top->floppy_drive, R->busy, R->mf_estate, R->sd_state);
+				}
 				uint8_t st = rd(R_CMD);
 				return std::make_pair(hang, st);
 			};
@@ -880,11 +898,12 @@ int main(int argc, char **argv)
 				wr(R_SECTOR, 1);
 				size_t b2;
 				auto q = cmd_flip(0x80, b2);                      // read sector 1
-				bool ok = !a.first && !r.first && !q.first && !(a.second & 0x10) && !(r.second & 0x10) && !(q.second & 0x1C) && b > 5000 && b2 == 512;
+				bool ok = !a.first && !r.first && !q.first && !(a.second & 0x10) && !(r.second & 0x10) && !(q.second & 0x14) && b > 5000 && b2 == 512;
 				if (!ok) { bad++; printf("flip %d: c%d seek %s %02x, read track %s %02x %zu bytes, sector %s %02x %zu\n", it, c,
 					a.first ? "HANG" : "ok", a.second, r.first ? "HANG" : "ok", r.second, b, q.first ? "HANG" : "ok", q.second, b2); }
 			}
-			printf("%s: flip test %d rounds, %d bad\n", f, flip_n, bad);
+			printf("%s: flip test %d rounds, %d bad, %d track requests answered on drive B\n", f, flip_n, bad, sd_wrong_drive);
+			bad += sd_wrong_drive;
 			fails += bad;
 			continue;
 		}
