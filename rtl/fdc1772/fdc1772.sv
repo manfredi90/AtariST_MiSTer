@@ -95,6 +95,7 @@ reg         fdn_hd[FD_NUM];
 reg         fdn_fm[FD_NUM];
 reg         fdn_present[FD_NUM];
 reg         fdn_mfmt[FD_NUM];   // image is an MFMT track image
+reg         fdn_was_mfmt[FD_NUM]; // the last disk was MFMT (kept while the drive is empty)
 
 reg  [11:0] image_sectors;
 reg  [11:0] image_sps; // sectors/side
@@ -204,6 +205,7 @@ always @(posedge clkcpu) begin
 		if (~img_mountedD[i] && img_mounted[i]) begin
 			fdn_present[i] <= |img_size;
 			fdn_mfmt[i] <= img_mfmt && |img_size;
+			if (|img_size) fdn_was_mfmt[i] <= img_mfmt;
 			fdn_sector_len[i] <= sector_size;
 			fdn_spt[i] <= image_spt;
 			fdn_gap_len[i] <= image_gap_len;
@@ -346,6 +348,11 @@ wire       fd_present     = fd_any ? fdn_present[fdn]     : 1'b0;
 localparam integer GONE_CLKS = 6 * CLKCPU_KHZ;
 reg [18:0] absent_cnt;
 wire       fd_gone = absent_cnt == GONE_CLKS;
+// While the player swaps disks in drive A (after an STX), a read command
+// waits like on a real drive, which sends no index pulses without a disk,
+// and goes on with the new disk. Ending it with record not found made
+// Xenon 2 give up on the swap.
+wire       fd_swap_wait = fdn == 0 && fdn_was_mfmt[0];
 always @(posedge clkcpu) begin
 	if (fd_present) absent_cnt <= 0;
 	else if (!fd_gone) absent_cnt <= absent_cnt + 1'd1;
@@ -618,7 +625,7 @@ always @(posedge clkcpu) begin
 				if(!fd_present) begin
 					// no image selected -> irq once the drive has been empty
 					// for 6 ms (a moment on another drive is not an empty one)
-					if (fd_gone) begin
+					if (fd_gone && !fd_swap_wait) begin
 						RNF <= 1'b1;
 						busy <= 1'b0;
 						irq_set <= 1'b1; // emit irq when command done
@@ -742,7 +749,7 @@ always @(posedge clkcpu) begin
 			if(cmd_type_3) begin
 				if(!fd_present) begin
 					// no image selected -> irq once the drive has been empty for 6 ms
-					if (fd_gone) begin
+					if (fd_gone && !fd_swap_wait) begin
 						RNF <= 1'b1;
 						busy <= 1'b0;
 						irq_set <= 1'b1; // emit irq when command done

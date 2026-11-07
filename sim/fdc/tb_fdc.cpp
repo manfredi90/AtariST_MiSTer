@@ -784,7 +784,7 @@ int main(int argc, char **argv)
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	Verilated::commandArgs(argc, argv);
 	top = new Vfdc1772;
-	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0, rt_c = -1, flip_n = 0;
+	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0, rt_c = -1, flip_n = 0, swap_t = 0;
 	const char *replay_f = nullptr;
 	std::vector<const char *> files;
 	for (int i = 1; i < argc; i++)
@@ -794,6 +794,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "-stress") && i + 1 < argc) stress_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-rt") && i + 1 < argc) rt_c = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-flip") && i + 1 < argc) flip_n = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-swap")) swap_t = 1;
 		else if (!strcmp(argv[i], "-replay") && i + 1 < argc) replay_f = argv[++i];
 		else if (!strcmp(argv[i], "-turrican") && i + 1 < argc) turr_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-lat") && i + 1 < argc) sd_latency_max = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
@@ -853,6 +854,38 @@ int main(int argc, char **argv)
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
 
+		if (swap_t)
+		{
+			// disk swap like Xenon 2's: the loader reads sector 1 of track 0
+			// over and over; the disk goes out during a read and the new one
+			// comes in 2 s later. The read must wait and then succeed.
+			int bad = 0;
+			const StxTrack *t0 = g_img->find(0, 0);
+			const StxSector *s1 = nullptr;
+			for (auto &x : t0->sectors) if (x.id[2] == 1) { s1 = &x; break; }
+			for (int round = 0; round < 2; round++)
+			{
+				wr(R_DATA, 0); run(0x13, 4000);
+				wr(R_SECTOR, 1);
+				wr(R_CMD, 0x80);
+				ticks_n((uint64_t)(ms_to_disk(round ? 5 : 60) * 1e6 / NS_PER_TICK));
+				top->img_size = 0; top->img_mfmt = 0; top->img_mounted = 1; ticks_n(4); top->img_mounted = 0;
+				std::vector<uint8_t> got;
+				uint64_t t0t = ticks, lim = (uint64_t)(ms_to_disk(2000) * 1e6 / NS_PER_TICK);
+				while (!top->irq && ticks - t0t < lim) { if (top->drq) got.push_back(rd(R_DATA)); else tick(); }
+				bool early = top->irq;
+				got.clear();
+				top->img_size = (uint32_t)buf.size(); top->img_mfmt = 1; top->img_mounted = 1; ticks_n(4); top->img_mounted = 0;
+				t0t = ticks; lim = (uint64_t)(ms_to_disk(3000) * 1e6 / NS_PER_TICK);
+				while (!top->irq && ticks - t0t < lim) { if (top->drq) got.push_back(rd(R_DATA)); else tick(); }
+				uint8_t st = rd(R_CMD);
+				bool ok = !early && top->irq == 0 && !(st & 0x1C) && s1 && got.size() == 512 && !memcmp(got.data(), s1->data, 512);
+				printf("swap %d: %s, status %02x, %zu bytes%s\n", round, ok ? "ok" : "FAIL", st, got.size(), early ? " (ended while the drive was empty)" : "");
+				if (!ok) bad++;
+			}
+			fails += bad;
+			continue;
+		}
 		if (flip_n)
 		{
 			// commands while drive B is selected for 130 us at random moments,
