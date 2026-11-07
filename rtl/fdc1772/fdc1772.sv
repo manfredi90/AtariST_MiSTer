@@ -57,7 +57,12 @@ module fdc1772 (
 	input     [12:0] sd_buff_addr,
 	input     [15:0] sd_dout,
 	output    [15:0] sd_din,
-	input            sd_dout_strobe
+	input            sd_dout_strobe,
+
+	// debug events for Main (stx.log): head of the queue, valid, pop (toggle)
+	output    [95:0] dbg_q,
+	output           dbg_valid,
+	input            dbg_pop
 );
 
 
@@ -1422,6 +1427,101 @@ reg busy_drqD;
 always @(posedge clkcpu) begin
 	busy_drqD <= busy;
 	drq_drop <= (cmd_rx && !(cmd_type_4 && busy)) || (busy_drqD && !busy && data_lost);
+end
+
+// -------------------------------------------------------------------------
+// debug event queue, read by Main (ST_GET_FDCDBG) into stx.log
+// entry: type[95:88] time_us[87:56] payload[55:0]
+// -------------------------------------------------------------------------
+localparam DBG_CMD = 8'd1, DBG_END = 8'd2, DBG_SEL = 8'd3, DBG_IRQRD = 8'd4,
+           DBG_REG = 8'd5, DBG_MOUNT = 8'd6, DBG_DROP = 8'd15;
+localparam integer US_CLKS = CLKCPU_KHZ / 1000;
+
+reg [31:0] dbg_us;
+reg  [7:0] dbg_div;
+always @(posedge clkcpu) begin
+	if (dbg_div == US_CLKS - 1) begin dbg_div <= 0; dbg_us <= dbg_us + 1'd1; end
+	else dbg_div <= dbg_div + 1'd1;
+end
+
+reg [95:0] dbg_mem[0:63];
+reg  [5:0] dbg_wp = 0, dbg_rp = 0;
+reg [15:0] dbg_dropped = 0;
+reg        dbg_popD;
+reg [95:0] dbg_qr;
+always @(posedge clkcpu) dbg_qr <= dbg_mem[dbg_rp];
+assign dbg_q = dbg_qr;
+assign dbg_valid = dbg_wp != dbg_rp;
+wire dbg_full = (dbg_wp + 1'd1) == dbg_rp;
+
+// sources: payload held until written
+reg        p_cmd, p_end, p_sel, p_irq, p_reg, p_mnt;
+reg [55:0] v_cmd, v_end, v_sel, v_irq, v_reg, v_mnt;
+reg [31:0] t_cmd, t_end, t_sel, t_irq, t_reg, t_mnt;
+
+reg        dbg_busyD;
+reg  [2:0] dbg_selD;
+reg [15:0] dbg_bytes;
+reg  [W:0] dbg_mntD;
+reg        dbg_endD;
+
+always @(posedge clkcpu) begin
+	dbg_busyD <= busy;
+	dbg_selD <= {floppy_drive[1:0], floppy_side};
+	dbg_mntD <= img_mounted;
+	dbg_popD <= dbg_pop;
+	dbg_endD <= dbg_busyD && !busy;
+
+	if (cpu_we && cpu_addr == FDC_REG_CMDSTATUS) dbg_bytes <= 0;
+	else if (cpu_rw_data) dbg_bytes <= dbg_bytes + 1'd1;
+
+	if (dbg_pop != dbg_popD && dbg_valid) dbg_rp <= dbg_rp + 1'd1;
+
+	// one entry per clock; a source firing again before it was written replaces itself
+	if (p_cmd || p_end || p_sel || p_irq || p_reg || p_mnt) begin
+		if (dbg_full) dbg_dropped <= dbg_dropped + 1'd1;
+		else begin
+			dbg_wp <= dbg_wp + 1'd1;
+			if (dbg_dropped != 0) begin
+				dbg_mem[dbg_wp] <= {DBG_DROP, dbg_us, 40'd0, dbg_dropped};
+				dbg_dropped <= 0;
+			end
+			else if (p_irq) begin dbg_mem[dbg_wp] <= {DBG_IRQRD, t_irq, v_irq}; p_irq <= 0; end
+			else if (p_cmd) begin dbg_mem[dbg_wp] <= {DBG_CMD,   t_cmd, v_cmd}; p_cmd <= 0; end
+			else if (p_end) begin dbg_mem[dbg_wp] <= {DBG_END,   t_end, v_end}; p_end <= 0; end
+			else if (p_sel) begin dbg_mem[dbg_wp] <= {DBG_SEL,   t_sel, v_sel}; p_sel <= 0; end
+			else if (p_reg) begin dbg_mem[dbg_wp] <= {DBG_REG,   t_reg, v_reg}; p_reg <= 0; end
+			else            begin dbg_mem[dbg_wp] <= {DBG_MOUNT, t_mnt, v_mnt}; p_mnt <= 0; end
+		end
+	end
+
+	// sources (after the writer: a new event wins over clearing its pending flag)
+	if (cpu_we && cpu_addr == FDC_REG_CMDSTATUS) begin
+		p_cmd <= 1; t_cmd <= dbg_us;
+		v_cmd <= {cpu_din, track, sector, data_in, busy, fd_track, irq, drq, motor_on, 5'd0, 8'd0};
+	end
+	if (cpu_we && cpu_addr != FDC_REG_CMDSTATUS) begin
+		p_reg <= 1; t_reg <= dbg_us;
+		v_reg <= {6'd0, cpu_addr, cpu_din, busy, fd_track, 32'd0};
+	end
+	if (dbg_endD) begin
+		p_end <= 1; t_end <= dbg_us;
+		v_end <= {status, track, sector, dbg_bytes, irq, fd_track, 8'd0};
+	end
+	if (dbg_selD != {floppy_drive[1:0], floppy_side}) begin
+		p_sel <= 1; t_sel <= dbg_us;
+		v_sel <= {floppy_drive[1:0], floppy_side, fd_present, fd_mfmt, mf_loaded, busy, irq,
+		          cmd, status, 1'b0, fd_track, 7'd0, mf_position};
+	end
+	if (cpu_rw_cmdstatus && cpu_rw && irq) begin
+		p_irq <= 1; t_irq <= dbg_us;
+		v_irq <= {status, cmd, 40'd0};
+	end
+	if (|(img_mounted & ~dbg_mntD)) begin
+		p_mnt <= 1; t_mnt <= dbg_us;
+		v_mnt <= {6'd0, img_mounted[1:0], 48'd0};
+	end
+
 end
 
 endmodule

@@ -186,6 +186,9 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1), .VDNUM(2)) hps_io
 );
 
 wire [35:0] EXT_BUS;
+wire [95:0] fdc_dbg_q;
+wire        fdc_dbg_valid;
+wire        fdc_dbg_pop;
 wire        dio_data_in_strobe;
 wire [15:0] dio_data_in_reg;
 wire        dio_data_out_strobe;
@@ -212,7 +215,11 @@ hps_ext hps_ext
 	.dma_nak(dio_dma_nak),
 
 	.dio_status(dio_status_in),
-	.dio_status_idx(dio_status_index)
+	.dio_status_idx(dio_status_index),
+
+	.fdc_dbg_q(fdc_dbg_q),
+	.fdc_dbg_valid(fdc_dbg_valid),
+	.fdc_dbg_pop(fdc_dbg_pop)
 );
 
 reg        dio_download;
@@ -1261,7 +1268,11 @@ fdc1772 #(.IMG_TYPE(1)) fdc1772 (
 	.sd_buff_addr   ( sd_buff_addr     ),
 	.sd_dout        ( sd_buff_dout     ),
 	.sd_din         ( sd_buff_din      ),
-	.sd_dout_strobe ( sd_buff_wr       )
+	.sd_dout_strobe ( sd_buff_wr       ),
+
+	.dbg_q          ( fdc_dbg_q        ),
+	.dbg_valid      ( fdc_dbg_valid    ),
+	.dbg_pop        ( fdc_dbg_pop      )
 );
 
 /* ------------------------------------------------------------------------------ */

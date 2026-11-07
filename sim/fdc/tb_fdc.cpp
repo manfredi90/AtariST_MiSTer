@@ -15,6 +15,7 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <utility>
 #include <string>
 #include "Vfdc1772.h"
 #include "Vfdc1772___024root.h"
@@ -147,6 +148,23 @@ static void wr(int reg, uint8_t v)
 	ticks_n(8);
 	top->cpu_sel = 0; top->cpu_rw = 1;
 	ticks_n(8);
+}
+
+// drain the debug event queue (what Main writes to stx.log)
+static void dbg_drain()
+{
+	int n = 0;
+	while (top->dbg_valid && n < 200)
+	{
+		const uint32_t *w = top->dbg_q;   // VlWide<3>: w[0] = bits 31:0
+		unsigned type = w[2] >> 24;
+		uint32_t us = ((w[2] & 0xFFFFFF) << 8) | (w[1] >> 24);
+		uint64_t pl = ((uint64_t)(w[1] & 0xFFFFFF) << 32) | w[0];
+		printf("  dbg type %u t %u us payload %014llx\n", type, us, (unsigned long long)pl);
+		top->dbg_pop = !top->dbg_pop;
+		tick(); tick(); tick();
+		n++;
+	}
 }
 
 static uint8_t rd(int reg)
@@ -756,7 +774,7 @@ int main(int argc, char **argv)
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	Verilated::commandArgs(argc, argv);
 	top = new Vfdc1772;
-	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0, rt_c = -1;
+	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0, rt_c = -1, flip_n = 0;
 	const char *replay_f = nullptr;
 	std::vector<const char *> files;
 	for (int i = 1; i < argc; i++)
@@ -765,6 +783,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "-n") && i + 1 < argc) every = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-stress") && i + 1 < argc) stress_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-rt") && i + 1 < argc) rt_c = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-flip") && i + 1 < argc) flip_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-replay") && i + 1 < argc) replay_f = argv[++i];
 		else if (!strcmp(argv[i], "-turrican") && i + 1 < argc) turr_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-lat") && i + 1 < argc) sd_latency_max = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
@@ -824,6 +843,51 @@ int main(int argc, char **argv)
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
 
+		if (flip_n)
+		{
+			// commands while drive B is selected for 130 us at random moments,
+			// every 0-40 ms (TOS does it every 16 VBLs): no command may hang
+			// or end early
+			int bad = 0;
+			auto cmd_flip = [&](uint8_t c, size_t &bytes) {
+				wr(R_CMD, c);
+				uint64_t t0 = ticks, lim = (uint64_t)(ms_to_disk(3000) * 1e6 / NS_PER_TICK);
+				uint64_t next = ticks + rnd() % (uint64_t)(ms_to_disk(40) * 1e6 / NS_PER_TICK);
+				bytes = 0;
+				while (!top->irq && ticks - t0 < lim)
+				{
+					if (ticks >= next && !getenv("NOFLIP"))
+					{
+						top->floppy_drive = 1;
+						uint64_t te = ticks + (uint64_t)(0.13e6 / NS_PER_TICK);
+						while (ticks < te) { if (top->drq) { rd(R_DATA); bytes++; } else tick(); }
+						top->floppy_drive = 2;
+						next = ticks + rnd() % (uint64_t)(ms_to_disk(40) * 1e6 / NS_PER_TICK);
+					}
+					if (top->drq) { rd(R_DATA); bytes++; } else tick();
+				}
+				bool hang = !top->irq;
+				uint8_t st = rd(R_CMD);
+				return std::make_pair(hang, st);
+			};
+			for (int it = 0; it < flip_n; it++)
+			{
+				int c = 70 + rnd() % 10;
+				size_t b;
+				wr(R_DATA, (uint8_t)c);
+				auto a = cmd_flip(0x15, b);                       // seek with verify
+				auto r = cmd_flip(0xE4, b);                       // read track
+				wr(R_SECTOR, 1);
+				size_t b2;
+				auto q = cmd_flip(0x80, b2);                      // read sector 1
+				bool ok = !a.first && !r.first && !q.first && !(a.second & 0x10) && !(r.second & 0x10) && !(q.second & 0x1C) && b > 5000 && b2 == 512;
+				if (!ok) { bad++; printf("flip %d: c%d seek %s %02x, read track %s %02x %zu bytes, sector %s %02x %zu\n", it, c,
+					a.first ? "HANG" : "ok", a.second, r.first ? "HANG" : "ok", r.second, b, q.first ? "HANG" : "ok", q.second, b2); }
+			}
+			printf("%s: flip test %d rounds, %d bad\n", f, flip_n, bad);
+			fails += bad;
+			continue;
+		}
 		if (rt_c >= 0)
 		{
 			for (int k = 0; k < 3; k++)
@@ -845,6 +909,7 @@ int main(int argc, char **argv)
 				}
 				t.status = rd(R_CMD);
 				printf("seek %d status %02x, read track %zu bytes, status %02x (drive B selected for 130 us during it)\n", rt_c - k, sk.status, t.data.size(), t.status);
+				if (getenv("DBGQ")) dbg_drain();
 			}
 			continue;
 		}

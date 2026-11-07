@@ -34,7 +34,12 @@ module hps_ext
 	output reg        dma_nak,
 
 	input       [7:0] dio_status,
-	output      [3:0] dio_status_idx
+	output      [3:0] dio_status_idx,
+
+	// FDC debug events (stx.log)
+	input      [95:0] fdc_dbg_q,
+	input             fdc_dbg_valid,
+	output reg        fdc_dbg_pop
 );
 
 assign EXT_BUS[15:0] = io_dout;
@@ -44,19 +49,23 @@ wire io_strobe = EXT_BUS[33];
 wire io_enable = EXT_BUS[34];
 
 localparam EXT_CMD_MIN     = ST_WRITE_MEMORY;
-localparam EXT_CMD_MAX     = ST_GET_DMASTATE;
+localparam EXT_CMD_MAX     = ST_GET_FDCDBG;
 
 localparam ST_WRITE_MEMORY = 8;
 localparam ST_READ_MEMORY  = 9;
 localparam ST_ACK_DMA      = 10;
 localparam ST_NAK_DMA      = 11;
 localparam ST_GET_DMASTATE = 12;
+localparam ST_GET_FDCDBG   = 13;
 
 reg [15:0] io_dout;
 reg        dout_en = 0;
 reg  [9:0] byte_cnt;
 
 assign dio_status_idx = byte_cnt[3:0] - 1'd1;
+
+reg [95:0] dbg;
+reg        dbg_v;
 
 always@(posedge clk_sys) begin
 	reg [15:0] cmd;
@@ -75,6 +84,11 @@ always@(posedge clk_sys) begin
 			cmd <= io_din;
 			dout_en <= (io_din >= EXT_CMD_MIN && io_din <= EXT_CMD_MAX);
 			if(io_din == ST_NAK_DMA) dma_nak <= ~dma_nak;
+			if(io_din == ST_GET_FDCDBG) begin
+				dbg <= fdc_dbg_q;
+				dbg_v <= fdc_dbg_valid;
+				if (fdc_dbg_valid) fdc_dbg_pop <= ~fdc_dbg_pop;
+			end
 		end else begin
 			case(cmd)
 				ST_WRITE_MEMORY:
@@ -99,6 +113,18 @@ always@(posedge clk_sys) begin
 					begin
 						io_dout <= dio_status;
 					end
+
+				ST_GET_FDCDBG:
+					case(byte_cnt[2:0])
+						1: io_dout <= {15'h6D80, dbg_v};   // 0xDB00 | valid
+						2: io_dout <= dbg[95:80];
+						3: io_dout <= dbg[79:64];
+						4: io_dout <= dbg[63:48];
+						5: io_dout <= dbg[47:32];
+						6: io_dout <= dbg[31:16];
+						7: io_dout <= dbg[15:0];
+						default: io_dout <= 0;
+					endcase
 			endcase
 		end
 	end
