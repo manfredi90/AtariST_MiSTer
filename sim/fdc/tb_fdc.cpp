@@ -39,7 +39,8 @@ static int verbose = 0;
 
 struct Track { std::vector<uint8_t> meta, cells; };
 static const StxImage *g_img;
-static std::vector<uint8_t> st_file;   // plain .st image for the sector path regression test
+static std::vector<uint8_t> st_file;
+static bool scp_mode = false;            // the image under test is the SCP made from the STX   // plain .st image for the sector path regression test
 static std::map<int, Track> cache;
 
 static const Track &get_track(int cyl, int head)
@@ -146,6 +147,13 @@ static void tick()
 	top->clkcpu = 0; top->eval();
 	top->clkcpu = 1; top->eval();
 	ticks++;
+	static FILE *fl = getenv("FLUXLOG") ? fopen(getenv("FLUXLOG"), "w") : nullptr;
+	if (fl)
+	{
+		auto *R = top->rootp->fdc1772;
+		if (R->scp_drive__DOT__flux_edge) fprintf(fl, "E %llu %d %d %u\n", (unsigned long long)ticks, R->scp_drive__DOT__pb, R->scp_drive__DOT__k, R->scp_drive__DOT__t_edge);
+		if (R->scp_drive__DOT__idx_pulse) fprintf(fl, "I %llu pb %d rev %d cyl %d valid %d n0 %d n1 %d carry %d per %d rem %d hist %d phase %d units %u %u idx %u %u %u len %u %u %u data %u %u %u\n", (unsigned long long)ticks, R->scp_drive__DOT__pb, R->scp_drive__DOT__cur_rev, R->scp_drive__DOT__v_cyl, R->scp_drive__DOT__valid, R->scp_drive__DOT__b_nflux[0], R->scp_drive__DOT__b_nflux[1], (int)R->scp_drive__DOT__carry, (int)R->scp_drive__DOT__period, (int)(int16_t)R->scp_drive__DOT__rem, (int)R->scp_drive__DOT__hist, (int)(int16_t)R->scp_drive__DOT__phase, R->scp_drive__DOT__b_units[0], R->scp_drive__DOT__b_units[1], R->scp_drive__DOT__rv_index[0], R->scp_drive__DOT__rv_index[1], R->scp_drive__DOT__rv_index[2], R->scp_drive__DOT__rv_len[0], R->scp_drive__DOT__rv_len[1], R->scp_drive__DOT__rv_len[2], R->scp_drive__DOT__rv_data[0], R->scp_drive__DOT__rv_data[1], R->scp_drive__DOT__rv_data[2]);
+	}
 }
 static void ticks_n(int n) { while (n--) tick(); }
 
@@ -342,7 +350,18 @@ static int check_track(int cyl, int head, int &cur_cyl)
 			}
 			if (eq) { m = x; break; }
 		}
-		if (!m) { fail("sector %02x: data matches no STX sector (%d bytes)", sec.id[2], (int)c.data.size()); continue; }
+		if (!m)
+		{
+			if (verbose && !cand.empty())
+			{
+				const StxSector *x = cand[0];
+				int first = -1, nd = 0;
+				for (int i = 0; i < x->size && i < (int)c.data.size(); i++) if (c.data[i] != x->data[i]) { if (first < 0) first = i; nd++; }
+				printf("    sector %02x: %d bytes differ from byte %d, status %02x\n", sec.id[2], nd, first, c.status);
+			}
+			fail("sector %02x: data matches no STX sector (%d bytes)", sec.id[2], (int)c.data.size());
+			continue;
+		}
 
 		bool exp_crc = (m->status & STX_SECT_CRC_ERROR) || m->fuzzy;
 		bool exp_del = m->status & STX_SECT_DELETED;
@@ -370,7 +389,7 @@ static int check_track(int cyl, int head, int &cur_cyl)
 		double terr = fabs(meas - exp) / exp * 100.0;
 		if (timed && verbose) printf("  sector %02x timed: %.1f us, expected %.1f us\n", sec.id[2], meas / 1000, exp / 1000);
 		if (timed && terr > max_terr) max_terr = terr;
-		if (timed && terr > 0.3) fail("sector %02x: %d us, expected %d us", sec.id[2], (int)(meas / 1000), (int)(exp / 1000));
+		if (timed && terr > (scp_mode ? 0.6 : 0.3)) fail("sector %02x: %d us, expected %d us", sec.id[2], (int)(meas / 1000), (int)(exp / 1000));
 		rs_ok++;
 	}
 
@@ -387,12 +406,30 @@ static int check_track(int cyl, int head, int &cur_cyl)
 			wd.load(tr.meta.data(), tr.cells.data(), err);
 			wd.spin(3, 7);
 			auto ref = wd.read_track(wd.cells_per_rev());
-			size_t n = std::min(ref.size(), c.data.size()), eq = 0;
-			for (size_t i = 0; i < n; i++) if (ref[i] == c.data[i]) eq++;
+			size_t eq = 0;
+			// flux: the data separator locks a few cells into the turn, so the
+			// bytes may sit one or two places later or earlier
+			for (int sh = scp_mode ? -4 : 0; sh <= (scp_mode ? 4 : 0); sh++)
+			{
+				size_t e = 0;
+				for (size_t i = 0; i < c.data.size(); i++)
+				{
+					long j = (long)i + sh;
+					if (j >= 0 && j < (long)ref.size() && ref[j] == c.data[i]) e++;
+				}
+				if (e > eq) eq = e;
+			}
 			rt_pct = 100.0 * eq / ref.size();
+			if (getenv("RTDUMP"))
+			{
+				FILE *d = fopen("/tmp/rt_core.bin", "wb"); fwrite(c.data.data(), 1, c.data.size(), d); fclose(d);
+				d = fopen("/tmp/rt_model.bin", "wb"); fwrite(ref.data(), 1, ref.size(), d); fclose(d);
+			}
 			bool weak = h->weak_count > 0;
-			if (c.data.size() != ref.size() && !weak) fail("read track %d bytes, model %d", (int)c.data.size(), (int)ref.size());
-			if (rt_pct < (weak ? 90.0 : 100.0)) fail("read track matches %d %%", (int)rt_pct);
+			// flux: the data separator locks a few cells into the turn, the count may differ by a few bytes
+			int slack = scp_mode ? 16 : 0;
+			if (abs((int)c.data.size() - (int)ref.size()) > slack && !weak) fail("read track %d bytes, model %d", (int)c.data.size(), (int)ref.size());
+			if (rt_pct < (weak ? (scp_mode ? 85.0 : 90.0) : (scp_mode ? 97.0 : 100.0))) fail("read track matches %d %%", (int)rt_pct);
 			if (c.status & 0x04) fail("read track lost data");
 		}
 	}
@@ -779,13 +816,74 @@ static int replay(const char *evfile)
 	return diverg + stat_bad + data_bad;
 }
 
+
+// A real SCP image with nothing to compare against: every track is read like
+// TOS would (read address for the IDs, then each sector) and summed up.
+static int check_raw_scp(const char *path)
+{
+	FILE *sf = fopen(path, "rb");
+	if (!sf) { perror(path); return 1; }
+	fseek(sf, 0, SEEK_END); st_file.resize(ftell(sf)); fseek(sf, 0, SEEK_SET);
+	if (fread(st_file.data(), 1, st_file.size(), sf) != st_file.size()) return 1;
+	fclose(sf);
+	int last = st_file[7], heads = st_file[10];
+	int cyls = last / 2 + 1;
+	scp_mode = true;
+	top->floppy_reset = 0; top->cpu_sel = 0; top->cpu_rw = 1;
+	top->floppy_drive = 2; top->floppy_side = 1;
+	top->img_wp = 0; top->img_mfmt = 0; top->img_size = 0; top->img_mounted = 0;
+	ticks_n(100);
+	top->floppy_reset = 1;
+	ticks_n(100);
+	top->img_size = (uint32_t)st_file.size(); top->img_mfmt = 0; top->img_mounted = 1;
+	ticks_n(4); top->img_mounted = 0;
+	ticks_n((int)(ms_to_disk(50) * 1e6 / NS_PER_TICK));
+	run(0x08, 3000);
+	int tot_ids = 0, tot_ok = 0, tot_crc = 0, tot_rnf = 0, bad_tracks = 0;
+	int only = getenv("RAWTRK") ? atoi(getenv("RAWTRK")) : -1;   // cyl*2+head
+	for (int cyl = 0; cyl < cyls && cyl < 84; cyl++)
+		for (int head = 0; head < (heads == 0 ? 2 : 1); head++)
+		{
+			if (only >= 0 && (cyl * 2 + head > only || cyl * 2 + head < only - (getenv("RAWBACK") ? atoi(getenv("RAWBACK")) : 0))) continue;
+			top->floppy_side = head ? 0 : 1;
+			wr(R_DATA, cyl); run(0x18, 3000);
+			std::map<int, std::vector<uint8_t>> ids;   // by sector number
+			for (int n = 0; n < 24; n++)
+			{
+				Cmd c = run(0xC8, ms_to_disk(200.0 * 6) + 100);
+				if (c.data.size() == 6 && !(c.status & 0x18)) ids[c.data[2]] = c.data;
+				else if (c.status & 0x10) { if (verbose) { auto *R = top->rootp->fdc1772; printf("    read address RNF (status %02x), scp lstate %d valid %d formatted %d v_cyl %d head %d\n", c.status, R->scp_drive__DOT__lstate, R->scp_drive__DOT__valid, R->scp_drive__DOT__formatted, R->scp_drive__DOT__v_cyl, R->scp_drive__DOT__v_head); } break; }
+			}
+			int ok = 0, crc = 0, rnf = 0;
+			std::string bad;
+			for (auto &kv : ids)
+			{
+				const auto &id = kv.second;
+				wr(R_TRACK, id[0]); wr(R_SECTOR, id[2]);
+				Cmd c = run(0x88, ms_to_disk(200.0 * 8) + 100);
+				if (c.status & 0x10) { rnf++; bad += " s" + std::to_string(id[2]) + ":RNF"; }
+				else if (c.status & 0x08) { crc++; bad += " s" + std::to_string(id[2]) + ":CRC"; }
+				else if ((int)c.data.size() == (128 << (id[3] & 3))) ok++;
+				else bad += " s" + std::to_string(id[2]) + ":size";
+			}
+			tot_ids += ids.size(); tot_ok += ok; tot_crc += crc; tot_rnf += rnf;
+			bool odd = ids.empty() || ok != (int)ids.size();
+			if (odd) bad_tracks++;
+			if (odd || verbose) printf("c%02d h%d: %zu IDs, %d good%s\n", cyl, head, ids.size(), ok, bad.c_str());
+		}
+	printf("%s: %d IDs, %d sectors good, %d CRC errors, %d RNF, %d unusual tracks\n", path, tot_ids, tot_ok, tot_crc, tot_rnf, bad_tracks);
+	st_file.clear();
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	Verilated::commandArgs(argc, argv);
 	top = new Vfdc1772;
-	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0, rt_c = -1, flip_n = 0, swap_t = 0;
+	int only_c = -1, only_h = -1, every = 1, fails = 0, stress_n = 0, turr_n = 0, rt_c = -1, flip_n = 0, swap_t = 0, fuzzy_t = 0;
 	const char *replay_f = nullptr;
+	const char *scp_dir = nullptr;      // -scp DIR: mount DIR/<name>.scp, check against <name>.stx
 	std::vector<const char *> files;
 	for (int i = 1; i < argc; i++)
 	{
@@ -799,6 +897,9 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "-turrican") && i + 1 < argc) turr_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "-lat") && i + 1 < argc) sd_latency_max = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
 		else if (!strcmp(argv[i], "-v")) verbose = 1;
+		else if (!strcmp(argv[i], "-scp") && i + 1 < argc) scp_dir = argv[++i];
+		else if (!strcmp(argv[i], "-fuzzy")) fuzzy_t = 1;
+		else if (!strcmp(argv[i], "-rawscp") && i + 1 < argc) { fails += check_raw_scp(argv[++i]); }
 		else if (!strcmp(argv[i], "-st")) { fails += check_st(); }
 		else if (argv[i][0] != '+') files.push_back(argv[i]);
 	}
@@ -823,7 +924,24 @@ int main(int argc, char **argv)
 		ticks_n(100);
 		top->floppy_reset = 1;
 		ticks_n(100);
-		top->img_size = (uint32_t)buf.size(); top->img_mfmt = 1; top->img_mounted = 1;
+		scp_mode = scp_dir != nullptr;
+		if (scp_dir)
+		{
+			// the SCP made from this STX (stx2scp), read by the core itself
+			std::string base = f;
+			size_t sl = base.find_last_of('/');
+			if (sl != std::string::npos) base = base.substr(sl + 1);
+			if (base.size() > 4) base = base.substr(0, base.size() - 4);
+			std::string sp = std::string(scp_dir) + "/" + base + ".scp";
+			FILE *sf = fopen(sp.c_str(), "rb");
+			if (!sf) { perror(sp.c_str()); return 2; }
+			fseek(sf, 0, SEEK_END); st_file.resize(ftell(sf)); fseek(sf, 0, SEEK_SET);
+			if (fread(st_file.data(), 1, st_file.size(), sf) != st_file.size()) return 2;
+			fclose(sf);
+			top->img_size = (uint32_t)st_file.size(); top->img_mfmt = 0;
+		}
+		else { top->img_size = (uint32_t)buf.size(); top->img_mfmt = 1; }
+		top->img_mounted = 1;
 		ticks_n(4);
 		top->img_mounted = 0;
 		ticks_n(100);
@@ -854,6 +972,36 @@ int main(int argc, char **argv)
 		ticks_n((int)(30e6 / NS_PER_TICK));   // track loaded
 		if (!check_index_bit("MFMT type I status", 200.0 / DISK_SCALE)) fails++;
 
+		if (fuzzy_t)
+		{
+			// fuzzy sectors (Dungeon Master, Lotus): read each 4 times, the data
+			// must not always be the same, and the CRC must fail
+			int bad = 0, n = 0;
+			for (auto &t : g_img->tracks())
+				for (auto &x : t.sectors)
+				{
+					if (!x.fuzzy) continue;
+					n++;
+					top->floppy_side = t.head ? 0 : 1;
+					wr(R_DATA, t.cylinder); run(0x18, 3000);
+					std::set<std::vector<uint8_t>> seen;
+					int crc = 0;
+					for (int r = 0; r < 4; r++)
+					{
+						wr(R_TRACK, x.id[0]); wr(R_SECTOR, x.id[2]);
+						Cmd c = run(0x80, ms_to_disk(200.0 * 8) + 100);
+						seen.insert(c.data);
+						if (c.status & 0x08) crc++;
+						ticks_n((uint64_t)(ms_to_disk(rnd() % 200) * 1e6 / NS_PER_TICK));
+					}
+					bool ok = seen.size() > 1 && crc == 4;
+					printf("fuzzy c%02d h%d s%02x: %zu different reads of 4, %d CRC errors %s\n", t.cylinder, t.head, x.id[2], seen.size(), crc, ok ? "ok" : "FAIL");
+					if (!ok) bad++;
+				}
+			printf("%s: %d fuzzy sectors, %d bad\n", f, n, bad);
+			fails += bad;
+			continue;
+		}
 		if (swap_t)
 		{
 			// disk swap like Xenon 2's: the loader reads sector 1 of track 0
@@ -875,10 +1023,18 @@ int main(int argc, char **argv)
 				while (!top->irq && ticks - t0t < lim) { if (top->drq) got.push_back(rd(R_DATA)); else tick(); }
 				bool early = top->irq;
 				got.clear();
-				top->img_size = (uint32_t)buf.size(); top->img_mfmt = 1; top->img_mounted = 1; ticks_n(4); top->img_mounted = 0;
+				if (scp_mode) { top->img_size = (uint32_t)st_file.size(); top->img_mfmt = 0; }
+				else { top->img_size = (uint32_t)buf.size(); top->img_mfmt = 1; }
+				top->img_mounted = 1; ticks_n(4); top->img_mounted = 0;
 				t0t = ticks; lim = (uint64_t)(ms_to_disk(3000) * 1e6 / NS_PER_TICK);
 				while (!top->irq && ticks - t0t < lim) { if (top->drq) got.push_back(rd(R_DATA)); else tick(); }
 				uint8_t st = rd(R_CMD);
+				if (scp_mode)
+				{
+					auto *R = top->rootp->fdc1772;
+					printf("    scp: sd_rd %d sd_ack %d tbstate %d is_scp %d probing %d lstate %d valid %d formatted %d\n", top->sd_rd, top->sd_ack, sd.state, R->sc_is_scp, R->sc_probing,
+						R->scp_drive__DOT__lstate, R->scp_drive__DOT__valid, R->scp_drive__DOT__formatted);
+				}
 				bool ok = !early && top->irq == 0 && !(st & 0x1C) && s1 && got.size() == 512 && !memcmp(got.data(), s1->data, 512);
 				printf("swap %d: %s, status %02x, %zu bytes%s\n", round, ok ? "ok" : "FAIL", st, got.size(), early ? " (ended while the drive was empty)" : "");
 				if (!ok) bad++;

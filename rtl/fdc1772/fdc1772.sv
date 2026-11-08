@@ -328,8 +328,11 @@ always begin
 end
 
 wire       fd_any         = ~&floppy_drive;
+wire [1:0] sc_is_scp, sc_probing;                // SCP drive (scp_track below)
 
-wire       fd_mfmt        = fd_any && fdn_present[fdn] && fdn_mfmt[fdn];
+wire       fd_mfmt_img    = fd_any && fdn_present[fdn] && fdn_mfmt[fdn];   // MFMT tracks from Main
+wire       fd_scp         = fd_any && fdn_present[fdn] && sc_is_scp[fdn];  // SCP flux, read by the core
+wire       fd_mfmt        = fd_mfmt_img | fd_scp;                          // the cell path
 // floppy.v and the logic below use an active low index (0 during the pulse);
 // the MFMT drive outputs it active high
 wire       fd_index       = fd_any ? (fd_mfmt ? !mf_index : fdn_index[fdn]) : 1'b0;
@@ -339,7 +342,7 @@ wire [4:0] fd_sector      = fd_any ? fdn_sector[fdn]      : 5'd0;
 wire       fd_sector_hdr  = fd_any ? fdn_sector_hdr[fdn]  : 1'b0;
 //wire     fd_sector_data = fd_any ? fdn_sector_data[fdn] : 1'b0;
 wire       fd_dclk_en     = fd_any ? fdn_dclk[fdn]        : 1'b0;
-wire       fd_present     = fd_any ? fdn_present[fdn]     : 1'b0;
+wire       fd_present     = fd_any ? fdn_present[fdn] && !sc_probing[fdn] : 1'b0;
 
 // A command ends with record not found only once no disk has been seen for
 // 6 ms. TOS's VBL routine selects drive B for a moment every 16 VBLs, even
@@ -354,7 +357,16 @@ wire       fd_gone = absent_cnt == GONE_CLKS;
 // and goes on with the new disk. Ending it with record not found made
 // Xenon 2 give up on the swap. A seek steps on as well: the head of a real
 // drive moves with or without a disk.
-wire       fd_swap_wait = fdn == 0 && fdn_was_mfmt[0];
+reg        was_scp0;   // the last disk in drive A was SCP (kept while it is empty)
+reg        sc_probingD0;
+always @(posedge clkcpu) begin
+	// decided once the header of the new disk has been read (the swap wait
+	// covers the probe too)
+	sc_probingD0 <= sc_probing[0];
+	if (img_mounted[0] && |img_size && img_mfmt) was_scp0 <= 0;
+	if (sc_probingD0 && !sc_probing[0]) was_scp0 <= sc_is_scp[0];
+end
+wire       fd_swap_wait = fdn == 0 && (fdn_was_mfmt[0] || was_scp0);
 always @(posedge clkcpu) begin
 	if (fd_present) absent_cnt <= 0;
 	else if (!fd_gone) absent_cnt <= absent_cnt + 1'd1;
@@ -847,6 +859,13 @@ reg data_transfer_done;
 wire        mf_sd_busy, mf_sd_rd, mf_cell_stb, mf_cell, mf_index, mf_loaded;
 wire [31:0] mf_lba;
 wire  [5:0] mf_blk_cnt;
+wire        mt_sd_busy, mt_cell_stb, mt_cell, mt_index, mt_loaded;
+wire [16:0] mt_position;
+wire        sc_sd_busy, sc_sd_rd, sc_sd_drive, sc_cell_stb, sc_cell, sc_index, sc_loaded;
+wire [31:0] sc_lba;
+wire  [5:0] sc_blk_cnt;
+wire [16:0] sc_position;
+
 wire [16:0] mf_position;
 
 reg  [W:0] mf_mountedD;
@@ -859,7 +878,7 @@ mfmt_track #(
 ) mfmt_drive (
 	.clk            ( clkcpu         ),
 	.reset          ( !floppy_reset  ),
-	.enable         ( fd_mfmt && sd_state == SD_IDLE ),
+	.enable         ( fd_mfmt_img && sd_state == SD_IDLE ),
 	.cyl            ( fd_track       ),
 	.head           ( !floppy_side   ),  // ST: side select is active low
 	.drive          ( fdn[0]         ),
@@ -871,13 +890,58 @@ mfmt_track #(
 	.sd_buff_addr   ( sd_buff_addr   ),
 	.sd_dout        ( sd_dout        ),
 	.sd_dout_strobe ( sd_dout_strobe ),
-	.busy           ( mf_sd_busy     ),
-	.cell_stb       ( mf_cell_stb    ),
-	.cell_bit       ( mf_cell        ),
-	.index          ( mf_index       ),
-	.loaded         ( mf_loaded      ),
-	.position       ( mf_position    )
+	.busy           ( mt_sd_busy     ),
+	.cell_stb       ( mt_cell_stb    ),
+	.cell_bit       ( mt_cell        ),
+	.index          ( mt_index       ),
+	.loaded         ( mt_loaded      ),
+	.position       ( mt_position    )
 );
+
+// SCP flux images: the core reads the file itself (Main mounts it as any
+// other image); see scp_track.sv
+reg  [1:0] sc_mount_ok;
+always @(*) for (int i = 0; i < 2; i++) sc_mount_ok[i] = (i < FD_NUM) && |img_size && !img_mfmt;
+
+scp_track #(
+	.ACC(16000000 / (CLKCPU_KHZ * 25)),  // 1/16 of 25 ns per clock
+	.INDEX_CLKS(4 * CLKCPU_KHZ),         // 4 ms index pulse
+	.SETTLE_CLKS(10 * CLKCPU_KHZ)        // 10 ms on a track before it is read
+) scp_drive (
+	.clk            ( clkcpu         ),
+	.reset          ( !floppy_reset  ),
+	.enable         ( fd_scp && sd_state == SD_IDLE ),
+	.sd_free        ( sd_state == SD_IDLE && !mt_sd_busy && !(|sd_rd_sec) ),
+	.cyl            ( fd_track       ),
+	.head           ( !floppy_side   ),
+	.drive          ( fdn[0]         ),
+	.mount          ( 2'(img_mounted & ~mf_mountedD) ),
+	.mount_ok       ( sc_mount_ok    ),
+	.pll_reset      ( cmd_rx         ),
+	.is_scp         ( sc_is_scp      ),
+	.probing        ( sc_probing     ),
+	.sd_lba         ( sc_lba         ),
+	.sd_rd          ( sc_sd_rd       ),
+	.sd_blk_cnt     ( sc_blk_cnt     ),
+	.sd_drive       ( sc_sd_drive    ),
+	.sd_ack         ( sd_ack         ),
+	.sd_buff_addr   ( sd_buff_addr   ),
+	.sd_dout        ( sd_dout        ),
+	.sd_dout_strobe ( sd_dout_strobe ),
+	.busy           ( sc_sd_busy     ),
+	.cell_stb       ( sc_cell_stb    ),
+	.cell_bit       ( sc_cell        ),
+	.index          ( sc_index       ),
+	.loaded         ( sc_loaded      ),
+	.position       ( sc_position    )
+);
+
+assign mf_sd_busy  = mt_sd_busy | sc_sd_busy;
+assign mf_cell_stb = fd_scp ? sc_cell_stb : mt_cell_stb;
+assign mf_cell     = fd_scp ? sc_cell     : mt_cell;
+assign mf_index    = fd_scp ? sc_index    : mt_index;
+assign mf_loaded   = fd_scp ? sc_loaded   : mt_loaded;
+assign mf_position = fd_scp ? sc_position : mt_position;
 
 localparam MF_OP_RSEC  = 2'd0;
 localparam MF_OP_RADDR = 2'd1;
@@ -1145,10 +1209,11 @@ reg [W:0] sd_rd_sec;
 // the empty drive B, so drive A never got its track and the command waited
 // forever (Ghouls'n Ghosts, Xenon 2)
 reg [WIDX:0] mf_rd_fdn;
-always @(posedge clkcpu) if (!mf_sd_busy) mf_rd_fdn <= fdn;
-assign sd_lba     = mf_sd_busy ? mf_lba : sd_lba_sec;
-assign sd_rd      = sd_rd_sec | (mf_sd_rd ? ((W+1)'(1) << mf_rd_fdn) : '0);
-assign sd_blk_cnt = mf_sd_busy ? mf_blk_cnt : 6'd0;
+always @(posedge clkcpu) if (!mt_sd_busy) mf_rd_fdn <= fdn;
+assign sd_lba     = sc_sd_busy ? sc_lba : mt_sd_busy ? mf_lba : sd_lba_sec;
+assign sd_rd      = sd_rd_sec | (mf_sd_rd ? ((W+1)'(1) << mf_rd_fdn) : '0)
+                              | (sc_sd_rd ? ((W+1)'(1) << sc_sd_drive) : '0);
+assign sd_blk_cnt = sc_sd_busy ? sc_blk_cnt : mt_sd_busy ? mf_blk_cnt : 6'd0;
 
 always @(posedge clkcpu) begin
 	reg sd_ackD;
