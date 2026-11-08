@@ -62,6 +62,23 @@ static struct { int state = 0, wait = 0; std::vector<uint16_t> words; size_t i =
 static uint32_t sd_latency_max = 0;
 static int sd_wrong_drive = 0;        // track requests seen on drive B     // ticks; random delay before Main answers (real Main polls)
 static uint32_t lat_rng = 1;
+// GWLAT=ms: like Main reading a real floppy on the Greaseweazle, the first
+// request inside a track of the SCP file waits this long (real ms), the
+// following ones (rest of that track, other revolutions) are answered at once
+static uint32_t gw_lat = 0;
+static std::set<int> gw_have;
+static int gw_slow = 0;
+static int scp_region(uint32_t lba)
+{
+	size_t pos = (size_t)lba * 512;
+	int best = -1; uint32_t bo = 0;
+	for (int n = 0; n < 168; n++)
+	{
+		uint32_t o = st_file[16 + n * 4] | st_file[17 + n * 4] << 8 | st_file[18 + n * 4] << 16 | (uint32_t)st_file[19 + n * 4] << 24;
+		if (o && o <= pos + 511 && o >= bo) { bo = o; best = n; }
+	}
+	return best;
+}
 static uint32_t rnd() { lat_rng = lat_rng * 1664525u + 1013904223u; return lat_rng >> 8; }
 
 static void sd_step()
@@ -82,6 +99,11 @@ static void sd_step()
 			// like Main, the request is looked at only when it gets polled
 			sd.state = 5;
 			sd.wait = 20 + (sd_latency_max ? rnd() % sd_latency_max : 0);
+			if (gw_lat && scp_mode && (top->sd_rd & 1) && !(top->sd_lba & 0x80000000u) && top->sd_lba > 1)
+			{
+				int r = scp_region(top->sd_lba);
+				if (r >= 0 && !gw_have.count(r)) { gw_have.insert(r); sd.wait += gw_lat; gw_slow++; }
+			}
 		}
 		break;
 	case 5:
@@ -871,7 +893,8 @@ static int check_raw_scp(const char *path)
 			if (odd) bad_tracks++;
 			if (odd || verbose) printf("c%02d h%d: %zu IDs, %d good%s\n", cyl, head, ids.size(), ok, bad.c_str());
 		}
-	printf("%s: %d IDs, %d sectors good, %d CRC errors, %d RNF, %d unusual tracks\n", path, tot_ids, tot_ok, tot_crc, tot_rnf, bad_tracks);
+	printf("%s: %d IDs, %d sectors good, %d CRC errors, %d RNF, %d unusual tracks%s\n", path, tot_ids, tot_ok, tot_crc, tot_rnf, bad_tracks,
+		gw_lat ? (" (" + std::to_string(gw_slow) + " slow track reads)").c_str() : "");
 	st_file.clear();
 	return 0;
 }
@@ -948,6 +971,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "-swap")) swap_t = 1;
 		else if (!strcmp(argv[i], "-replay") && i + 1 < argc) replay_f = argv[++i];
 		else if (!strcmp(argv[i], "-turrican") && i + 1 < argc) turr_n = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "-gwlat") && i + 1 < argc) gw_lat = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
 		else if (!strcmp(argv[i], "-lat") && i + 1 < argc) sd_latency_max = (uint32_t)(atof(argv[++i]) * 1e6 / NS_PER_TICK / DISK_SCALE);   // real ms
 		else if (!strcmp(argv[i], "-v")) verbose = 1;
 		else if (!strcmp(argv[i], "-scp") && i + 1 < argc) scp_dir = argv[++i];

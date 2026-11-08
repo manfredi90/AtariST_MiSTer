@@ -451,6 +451,14 @@ reg [17:0] index_cnt;
 reg  [1:0] fstate;               // fetch: 0 idle, 1 address set, 2 data
 wire [27:0] rev_len = (valid && formatted) ? b_units[pb] : REV_NOMINAL;
 wire        play    = valid && formatted && key_match;
+// a track is wanted and not there yet (see the index below). Kept while
+// TOS selects drive B for a moment, so the held index is not let go then.
+reg         want_track;
+always @(posedge clk) begin
+	if (reset || |mount || key_match) want_track <= 0;
+	else if (enable) want_track <= 1;
+end
+wire        hold_index = want_track && !key_match;
 wire        noise   = valid && !formatted && key_match;
 reg  [7:0]  res_mul;
 reg [27:0] t_last;               // last transition
@@ -486,6 +494,14 @@ always @(posedge clk) begin
 			carry <= 0;
 			seeking <= 1;
 			t <= t + ACC;
+		end
+		else if (t + ACC >= rev_len && hold_index) begin
+			// the track under the head is still being read from the file: no
+			// index pulse until it is there, as from a drive whose head is still
+			// settling, so the controller does not count turns without data.
+			// With a file on the SD card this is a few ms at most; a source that
+			// takes longer to answer (Main reading a real floppy) is waited for
+			// the same way.
 		end
 		else if (t + ACC >= rev_len) begin
 			// index: the revolution starts again, with the next one if it is there
