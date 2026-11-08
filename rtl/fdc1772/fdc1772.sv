@@ -68,6 +68,7 @@ module fdc1772 (
 
 parameter CLK_EN           = 16'd8000; // in kHz
 parameter CLKCPU_KHZ       = 32000;    // clkcpu frequency, for the MFMT drive timing
+parameter DEBUG_EVENTS     = 1'b0;     // != 0: queue FDC events for Main's stx.log (ST_GET_FDCDBG)
 parameter FD_NUM           = 2;    // number of supported floppies
 parameter MODEL            = 2;    // 0 - wd1770, 1 - fd1771, 2 - wd1772, 3 = wd1773/fd1793
 parameter EXT_MOTOR        = 1'b0; // != 0 if motor is controlled externally by floppy_motor
@@ -351,7 +352,8 @@ wire       fd_gone = absent_cnt == GONE_CLKS;
 // While the player swaps disks in drive A (after an STX), a read command
 // waits like on a real drive, which sends no index pulses without a disk,
 // and goes on with the new disk. Ending it with record not found made
-// Xenon 2 give up on the swap.
+// Xenon 2 give up on the swap. A seek steps on as well: the head of a real
+// drive moves with or without a disk.
 wire       fd_swap_wait = fdn == 0 && fdn_was_mfmt[0];
 always @(posedge clkcpu) begin
 	if (fd_present) absent_cnt <= 0;
@@ -532,10 +534,10 @@ always @(posedge clkcpu) begin
 
 			// ------------------------ TYPE I -------------------------
 			if(cmd_type_1) begin
-				// drive A is always there, and its head steps with or without a
-				// disk (Xenon 2 seeks while the player swaps disks); an empty
-				// drive B is taken as no drive
-				if(!fd_present && fdn != 0) begin
+				// during a disk swap in drive A (after an STX) the head steps
+				// without a disk, like on a real drive; otherwise an empty drive
+				// answers as no drive
+				if(!fd_present && !fd_swap_wait) begin
 					// no image selected -> irq once the drive has been empty
 					// for 6 ms (a moment on another drive is not an empty one)
 					if (fd_gone) begin
@@ -1475,8 +1477,9 @@ reg [15:0] dbg_dropped = 0;
 reg        dbg_popD;
 reg [95:0] dbg_qr;
 always @(posedge clkcpu) dbg_qr <= dbg_mem[dbg_rp];
-assign dbg_q = dbg_qr;
-assign dbg_valid = dbg_wp != dbg_rp;
+// with DEBUG_EVENTS off the queue reads empty and synthesis drops it
+assign dbg_q = DEBUG_EVENTS ? dbg_qr : 96'd0;
+assign dbg_valid = DEBUG_EVENTS && dbg_wp != dbg_rp;
 wire dbg_full = (dbg_wp + 1'd1) == dbg_rp;
 
 // sources: payload held until written

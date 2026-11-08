@@ -10,7 +10,7 @@ CLKCPU_KHZ ?= 32000
 OBJ         = obj_$(CLKCPU_KHZ)
 
 VFLAGS = --cc --exe --build -O2 --public-flat-rw -Wno-fatal -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-UNUSED \
-         -GIMG_TYPE=1 -GCLKCPU_KHZ=$(CLKCPU_KHZ) --top-module fdc1772 -Mdir $(OBJ) \
+         -GIMG_TYPE=1 -GCLKCPU_KHZ=$(CLKCPU_KHZ) -GDEBUG_EVENTS=1 --top-module fdc1772 -Mdir $(OBJ) \
          -CFLAGS "-O2 -std=gnu++17 -I$(ST) -I$(ST)/test -DTB_CLKCPU_KHZ=$(CLKCPU_KHZ)"
 
 SRC = $(RTL)/fdc1772.sv $(RTL)/floppy.v $(RTL)/mfmt_track.sv $(RTL)/mfm_dec.sv tb_fdc.cpp \
