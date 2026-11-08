@@ -876,6 +876,59 @@ static int check_raw_scp(const char *path)
 	return 0;
 }
 
+
+// two real SCP images, swapped like a player does it in the OSD: the
+// sectors read after the swap must come from the second file
+static bool load_file(const char *path, std::vector<uint8_t> &v)
+{
+	FILE *sf = fopen(path, "rb");
+	if (!sf) { perror(path); return false; }
+	fseek(sf, 0, SEEK_END); v.resize(ftell(sf)); fseek(sf, 0, SEEK_SET);
+	bool ok = fread(v.data(), 1, v.size(), sf) == v.size();
+	fclose(sf);
+	return ok;
+}
+
+static int check_swap_scp(const char *p1, const char *p2)
+{
+	std::vector<uint8_t> f1, f2;
+	if (!load_file(p1, f1) || !load_file(p2, f2)) return 1;
+	scp_mode = true;
+	st_file = f1;
+	top->floppy_reset = 0; top->cpu_sel = 0; top->cpu_rw = 1;
+	top->floppy_drive = 2; top->floppy_side = 1;
+	top->img_wp = 0; top->img_mfmt = 0; top->img_size = 0; top->img_mounted = 0;
+	ticks_n(100);
+	top->floppy_reset = 1;
+	ticks_n(100);
+	top->img_size = (uint32_t)st_file.size(); top->img_mounted = 1; ticks_n(4); top->img_mounted = 0;
+	ticks_n((int)(ms_to_disk(50) * 1e6 / NS_PER_TICK));
+	run(0x08, 3000);
+	auto rd_sec = [&](int cyl, int sec, std::vector<uint8_t> &data) {
+		wr(R_DATA, cyl); run(0x18, 3000);
+		wr(R_TRACK, cyl); wr(R_SECTOR, sec);
+		Cmd c = run(0x88, ms_to_disk(200.0 * 8) + 100);
+		data = c.data;
+		return c.status;
+	};
+	int fails = 0;
+	for (int round = 0; round < 3; round++)
+	{
+		std::vector<uint8_t> b1, b6, b1x;
+		int s1 = rd_sec(0, 1, b1), s6 = rd_sec(0, 6, b6), sx = rd_sec(37, 1, b1x);
+		printf("round %d (%s): c0 s1 status %02x %zu bytes [%02x %02x %02x %02x], c0 s6 status %02x, c37 s1 status %02x\n", round, round & 1 ? "disk 2" : "disk 1",
+			s1, b1.size(), b1.size() > 3 ? b1[0] : 0, b1.size() > 3 ? b1[1] : 0, b1.size() > 3 ? b1[2] : 0, b1.size() > 3 ? b1[3] : 0, s6, sx);
+		// eject, wait, insert the other disk
+		top->img_size = 0; top->img_mounted = 1; ticks_n(4); top->img_mounted = 0;
+		ticks_n((uint64_t)(ms_to_disk(1500) * 1e6 / NS_PER_TICK));
+		st_file = (round & 1) ? f1 : f2;
+		top->img_size = (uint32_t)st_file.size(); top->img_mounted = 1; ticks_n(4); top->img_mounted = 0;
+		ticks_n((uint64_t)(ms_to_disk(1500) * 1e6 / NS_PER_TICK));
+	}
+	st_file.clear();
+	return fails;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -900,6 +953,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "-scp") && i + 1 < argc) scp_dir = argv[++i];
 		else if (!strcmp(argv[i], "-fuzzy")) fuzzy_t = 1;
 		else if (!strcmp(argv[i], "-rawscp") && i + 1 < argc) { fails += check_raw_scp(argv[++i]); }
+		else if (!strcmp(argv[i], "-swapscp") && i + 2 < argc) { fails += check_swap_scp(argv[i + 1], argv[i + 2]); i += 2; }
 		else if (!strcmp(argv[i], "-st")) { fails += check_st(); }
 		else if (argv[i][0] != '+') files.push_back(argv[i]);
 	}
@@ -1131,6 +1185,7 @@ int main(int argc, char **argv)
 				}
 				t.status = rd(R_CMD);
 				printf("seek %d status %02x, read track %zu bytes, status %02x (drive B selected for 130 us during it)\n", rt_c - k, sk.status, t.data.size(), t.status);
+				if (getenv("RTDUMP")) { char fn[256]; snprintf(fn, sizeof(fn), "%s_%d.bin", getenv("RTDUMP"), k); FILE *d = fopen(fn, "wb"); fwrite(t.data.data(), 1, t.data.size(), d); fclose(d); }
 				if (getenv("DBGQ") && (getenv("DBGQ")[0] != '2' || k == (getenv("RTN") ? atoi(getenv("RTN")) : 3) - 1)) dbg_drain();
 			}
 			continue;
